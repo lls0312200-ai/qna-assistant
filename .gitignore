@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+.env
+.runtime/
+*.sqlite*
+*.db*
+*.pkl
+*.key
+*.dpapi
+master-key.*
+*.qbackup
+*.lock
+*.log
+test-results/

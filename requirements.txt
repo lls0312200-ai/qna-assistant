@@ -1,0 +1,8 @@
+fastapi==0.136.1
+uvicorn==0.47.0
+numpy==2.4.4
+cryptography==48.0.0
+argon2-cffi==25.1.0
+openai==2.38.0
+httpx==0.28.1
+pytest==9.0.3

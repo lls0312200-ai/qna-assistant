@@ -1,0 +1,41 @@
+{
+  "knowledge_records": 10000,
+  "build_seconds": 4.481,
+  "search_samples": 20,
+  "search_p95_seconds": 0.495,
+  "mode": "offline lexical demo",
+  "environment": "current Windows host, not standardized hardware",
+  "evaluation": {
+    "passed": true,
+    "total": 100,
+    "faq_total": 60,
+    "blocked_total": 40,
+    "automatic": 54,
+    "correct": 54,
+    "precision": 1.0,
+    "blocked_sent": 0,
+    "evaluated_at": "2026-09-23T06:15:04.608187+00:00",
+    "synthetic": true,
+    "scope": "모의 FAQ의 정확 일치·공백·문장부호 변형 60건과 보류 예제 40건의 합성 시험입니다. 실제 운영 품질·24시간 실행·의미 검색을 검증하지 않습니다."
+  },
+  "automated_tests": {
+    "passed": 25,
+    "subtests_passed": 5,
+    "elapsed_seconds": 8.98
+  },
+  "browser_checks": [
+    "login",
+    "manual draft generation",
+    "approved mock post",
+    "settings",
+    "1366px layout no horizontal overflow",
+    "390px layout no horizontal overflow",
+    "console errors: none"
+  ],
+  "not_verified": [
+    "real site",
+    "live OpenAI API",
+    "real SMTP delivery",
+    "24-hour soak"
+  ]
+}
