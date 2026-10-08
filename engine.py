@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from demo_data import EVALUATION, FAQS, PAST_UNANSWERED
-from rag import RAG, blocked_reason, redact, should_auto
+from rag import RAG, blocked_reason, redact, reply_rule_violation, reply_rules_ready, should_auto
 from security import load_master_key
 
 
@@ -26,8 +26,10 @@ def dumps(value):
 
 DEFAULTS = {
     "mode": "demo", "main_url": "demo://board", "qna_url": "demo://board/qna",
-    "poll_seconds": 300, "auto_enabled": False,
+    "poll_seconds": 14400, "auto_enabled": False,
     "allowed_categories": ["usage", "hours", "policy"], "last_sync": None,
+    "reply_rules": {"tone": "", "forbidden_phrases": [], "required_phrases": [],
+                    "blocked_topics": [], "exception_policy": ""}, "rules_version": 0,
     "connection_status": "미연결 · 모의 게시판", "evaluation_passed": False,
     "budget_krw": 30000, "smtp_host": "", "smtp_port": 587,
     "smtp_user": "", "smtp_from": "", "smtp_to": "", "smtp_tls": True,
@@ -59,7 +61,9 @@ class Engine:
                     recovery INTEGER NOT NULL DEFAULT 0,version INTEGER NOT NULL,conclusion TEXT NOT NULL DEFAULT '',
                     reason TEXT NOT NULL DEFAULT '',draft TEXT NOT NULL DEFAULT '',draft_version INTEGER,draft_revision INTEGER NOT NULL DEFAULT 0,
                     final_answer TEXT NOT NULL DEFAULT '',decision_reason TEXT NOT NULL DEFAULT '',
-                    external_answer_id TEXT,sources TEXT NOT NULL DEFAULT '[]',created_at TEXT,updated_at TEXT);
+                    external_answer_id TEXT,sources TEXT NOT NULL DEFAULT '[]',rule_version INTEGER,
+                    rule_check TEXT NOT NULL DEFAULT '',human_confirmed INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT,updated_at TEXT);
                 CREATE TABLE IF NOT EXISTS knowledge(
                     id INTEGER PRIMARY KEY AUTOINCREMENT,question TEXT NOT NULL,answer TEXT NOT NULL,category TEXT NOT NULL,
                     status TEXT NOT NULL,version INTEGER NOT NULL DEFAULT 1,auto_allowed INTEGER NOT NULL DEFAULT 0,
@@ -81,6 +85,13 @@ class Engine:
             """)
             if 'draft_revision' not in {r[1] for r in db.execute('PRAGMA table_info(questions)')}:
                 db.execute('ALTER TABLE questions ADD COLUMN draft_revision INTEGER NOT NULL DEFAULT 0')
+            question_columns = {r[1] for r in db.execute('PRAGMA table_info(questions)')}
+            if 'rule_version' not in question_columns:
+                db.execute('ALTER TABLE questions ADD COLUMN rule_version INTEGER')
+            if 'rule_check' not in question_columns:
+                db.execute("ALTER TABLE questions ADD COLUMN rule_check TEXT NOT NULL DEFAULT ''")
+            if 'human_confirmed' not in question_columns:
+                db.execute('ALTER TABLE questions ADD COLUMN human_confirmed INTEGER NOT NULL DEFAULT 0')
             db.execute("INSERT OR IGNORE INTO settings VALUES(1,?)", (dumps(DEFAULTS),))
             settings = self._settings(db)
             if not settings.get("demo_seeded"):
@@ -120,19 +131,57 @@ class Engine:
             settings = self._settings(db)
             if data.get("mode", "demo") != "demo":
                 raise ValueError("실제 사이트 연동은 아직 제공하지 않습니다. 모의 게시판을 사용해 주세요.")
-            if "poll_seconds" in data and not 10 <= int(data["poll_seconds"]) <= 3600:
-                raise ValueError("수집 주기는 10~3600초여야 합니다.")
+            if "poll_seconds" in data and not 300 <= int(data["poll_seconds"]) <= 86400:
+                raise ValueError("수집 주기는 300~86,400초여야 합니다.")
             if "allowed_categories" in data:
                 if not isinstance(data["allowed_categories"], list) or not set(data["allowed_categories"]).issubset({"usage", "hours", "policy"}):
                     raise ValueError("허용 범주가 올바르지 않습니다.")
+            rules_changed = False
+            if "reply_rules" in data:
+                rules = data["reply_rules"]
+                if not isinstance(rules, dict):
+                    raise ValueError("답변 규칙 형식이 올바르지 않습니다.")
+                allowed_rule_fields = {"tone", "forbidden_phrases", "required_phrases", "blocked_topics", "exception_policy"}
+                if set(rules) - allowed_rule_fields:
+                    raise ValueError("지원하지 않는 답변 규칙 항목이 있습니다.")
+                normalized = {}
+                for name in ("tone", "exception_policy"):
+                    value = str(rules.get(name, "")).strip()
+                    if not value or len(value) > 500:
+                        raise ValueError("말투와 예외 처리 기준은 1~500자로 입력하세요.")
+                    normalized[name] = value
+                for name in ("forbidden_phrases", "required_phrases", "blocked_topics"):
+                    values = rules.get(name, [])
+                    if not isinstance(values, list) or len(values) > 50:
+                        raise ValueError("규칙 목록은 항목별 최대 50개까지 입력할 수 있습니다.")
+                    cleaned = []
+                    for value in values:
+                        value = str(value).strip()
+                        if not value or len(value) > 100:
+                            raise ValueError("규칙 문구는 1~100자로 입력하세요.")
+                        if value not in cleaned:
+                            cleaned.append(value)
+                    normalized[name] = cleaned
+                rules_changed = normalized != settings.get("reply_rules")
+                data["reply_rules"] = normalized
+                if rules_changed:
+                    data["rules_version"] = int(settings.get("rules_version", 0)) + 1
+                    data["evaluation_passed"] = False
+                    data["auto_enabled"] = False
+            prospective = {**settings, **data}
             if data.get("auto_enabled"):
-                if not settings.get("evaluation_passed"):
+                if not reply_rules_ready(prospective):
+                    raise ValueError("답변 규칙을 저장한 후 자동 모드를 켤 수 있습니다.")
+                if not prospective.get("evaluation_passed"):
                     raise ValueError("모의 품질 평가를 통과한 후 자동 모드를 켤 수 있습니다.")
                 if not self._active_knowledge(db):
                     raise ValueError("승인된 활성 지식이 필요합니다.")
             settings.update(data)
             settings["mode"] = "demo"
             self._put_settings(db, settings)
+            if rules_changed:
+                db.execute("UPDATE questions SET status='review',draft_version=NULL,decision_reason=?,updated_at=? WHERE status='draft'",
+                           ("답변 규칙이 변경되어 초안을 다시 검토해야 합니다.", now()))
             self._audit(db, actor, "settings.update", detail={"fields": sorted(data.keys())})
             return settings
 
@@ -140,7 +189,7 @@ class Engine:
         if row is None:
             raise LookupError("항목을 찾을 수 없습니다.")
         item = dict(row)
-        for key in ("baseline", "recovery", "auto_allowed"):
+        for key in ("baseline", "recovery", "auto_allowed", "human_confirmed"):
             if key in item:
                 item[key] = bool(item[key])
         if "sources" in item:
@@ -187,6 +236,7 @@ class Engine:
             settings = self._settings(db)
             return {"counts": counts, "connection_status": settings["connection_status"],
                     "last_sync": settings["last_sync"], "auto_enabled": settings["auto_enabled"],
+                    "rules_version": settings.get("rules_version", 0),
                     "knowledge_active": len(self._active_knowledge(db)),
                     "notifications": [dict(row) for row in db.execute("SELECT * FROM notifications ORDER BY id DESC LIMIT 10")],
                     "questions": [self._row(row) for row in db.execute("SELECT * FROM questions ORDER BY id DESC LIMIT 8")],
@@ -335,6 +385,10 @@ class Engine:
             auto_allowed = bool(item.get("auto_allowed", False)) and status == "active"
             if auto_allowed and blocked_reason(question + "\n" + answer):
                 raise ValueError("개별 정보·민감한 요청·지시문이 포함된 지식은 자동 답변에 사용할 수 없습니다.")
+            if auto_allowed:
+                rules_error = reply_rule_violation(question, answer, self._settings(db), automatic=True)
+                if rules_error:
+                    raise ValueError("현재 답변 규칙을 통과하지 못했습니다: " + rules_error)
             if not is_admin:
                 auto_allowed = False
             values = (question, answer, category, status, int(auto_allowed), valid_until,
@@ -395,7 +449,7 @@ class Engine:
             if question["status"] in ("posted", "external", "sending", "confirm"):
                 raise ValueError("이 문의는 초안을 생성할 수 없는 상태입니다.")
             if self.ai:
-                draft = self.ai.draft(question, conclusion, reason, question["matches"])
+                draft = self.ai.draft(question, conclusion, reason, question["matches"], self.settings().get("reply_rules"))
             else:
                 draft = f"안녕하세요. 문의해 주셔서 감사합니다.\n\n{str(conclusion).strip()}\n\n{str(reason).strip()}\n\n추가로 궁금한 점이 있으시면 문의해 주세요. 감사합니다."
             result = self.save_draft(question_id, conclusion, reason, draft, actor)
@@ -442,6 +496,14 @@ class Engine:
             if not question["draft"].strip():
                 raise ValueError("게시할 초안을 먼저 저장해 주세요.")
             self._validate_sources(db, question["sources"])
+            rules_error = reply_rule_violation(self._query(question), question["draft"], settings, automatic=auto)
+            if rules_error:
+                with db:
+                    db.execute("UPDATE questions SET rule_version=?,rule_check=?,human_confirmed=?,updated_at=? WHERE id=?",
+                               (int(settings.get("rules_version", 0)), rules_error, int(not auto), now(), question_id))
+                    self._audit(db, actor, "answer.rule_rejected", question_id,
+                                {"auto": auto, "rules_version": int(settings.get("rules_version", 0))})
+                raise ValueError("현재 답변 규칙을 통과하지 못했습니다: " + rules_error)
             if auto:
                 if question["baseline"] or question["recovery"]:
                     raise ValueError("과거·복구 문의는 자동 답변 대상이 아닙니다.")
@@ -452,8 +514,10 @@ class Engine:
             with db:
                 db.execute("INSERT INTO outbox(question_id,operation_key,expected_version,answer,sources,auto,knowledge_candidate,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,'sending',?,?) ON CONFLICT(question_id) DO UPDATE SET operation_key=excluded.operation_key,expected_version=excluded.expected_version,answer=excluded.answer,sources=excluded.sources,auto=excluded.auto,knowledge_candidate=excluded.knowledge_candidate,status='sending',updated_at=excluded.updated_at",
                            (question_id, operation_key, question["version"], question["draft"], dumps(question["sources"]), int(auto), int(knowledge_candidate), now(), now()))
-                db.execute("UPDATE questions SET status='sending',updated_at=? WHERE id=?", (now(), question_id))
-                self._audit(db, actor, "answer.approved", question_id, {"auto": auto})
+                db.execute("UPDATE questions SET status='sending',rule_version=?,rule_check=?,human_confirmed=?,updated_at=? WHERE id=?",
+                           (int(settings.get("rules_version", 0)), "통과", int(not auto), now(), question_id))
+                self._audit(db, actor, "answer.approved", question_id,
+                            {"auto": auto, "rules_version": int(settings.get("rules_version", 0)), "rule_check": "passed"})
             # The mock site commits independently before the response is observed.
             # An app crash after this commit is resolved via operation_key, never reposted.
             with db:
@@ -498,6 +562,8 @@ class Engine:
         with self.lock:
             records = self._records()
             settings = {**self.settings(), "auto_enabled": True, "evaluation_passed": True}
+            if not reply_rules_ready(settings):
+                raise ValueError("답변 규칙을 저장한 후 자동 답변 평가를 실행하세요.")
             automatic = correct = blocked_sent = 0
             rows = []
             # The fixed fixture only uses demo lexical search, so evaluating is free
@@ -544,7 +610,8 @@ class Engine:
                     matches = self.search_knowledge(self._query(question))
                     allowed, reason, match = should_auto(question, matches, checks)
                     with closing(self.connect()) as db, db:
-                        db.execute("UPDATE questions SET decision_reason=?,updated_at=? WHERE id=?", (reason, now(), question["id"]))
+                        db.execute("UPDATE questions SET decision_reason=?,rule_version=?,rule_check=?,human_confirmed=0,updated_at=? WHERE id=?",
+                                   (reason, int(checks.get("rules_version", 0)), "통과" if allowed else reason, now(), question["id"]))
                     if allowed and not dry_run:
                         with closing(self.connect()) as db, db:
                             db.execute("UPDATE questions SET draft=?,draft_version=version,sources=?,status='draft' WHERE id=?", (match["answer"], dumps(self._snapshot([match])), question["id"]))
@@ -556,7 +623,9 @@ class Engine:
                 except Exception as exc:
                     reason = str(exc) if isinstance(exc, ValueError) else "검색 또는 자동 처리 오류 · 수동 검토가 필요합니다."
                     with closing(self.connect()) as db, db:
-                        db.execute("UPDATE questions SET decision_reason=?,updated_at=? WHERE id=?", (reason, now(), question["id"]))
+                        current = self._settings(db)
+                        db.execute("UPDATE questions SET decision_reason=?,rule_version=?,rule_check=?,human_confirmed=0,updated_at=? WHERE id=?",
+                                   (reason, int(current.get("rules_version", 0)), reason, now(), question["id"]))
                         self._audit(db, actor, "automatic.failed", question["id"], {"error_type": type(exc).__name__})
                     results.append({"id": question["id"], "eligible": False, "status": "review", "reason": reason})
             with closing(self.connect()) as db, db:

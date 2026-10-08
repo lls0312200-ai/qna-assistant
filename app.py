@@ -305,7 +305,7 @@ def create_app(data_dir=None, scheduler=True):
                 try:
                     await asyncio.wait_for(stop.wait(), timeout=10)
                 except asyncio.TimeoutError:
-                    seconds = max(10, min(3600, int(engine.settings().get('poll_seconds', 300))))
+                    seconds = max(300, min(86400, int(engine.settings().get('poll_seconds', 14400))))
                     if time.monotonic() - last_tick >= seconds:
                         await asyncio.to_thread(runtime.tick)
                         last_tick = time.monotonic()
@@ -499,7 +499,7 @@ def create_app(data_dir=None, scheduler=True):
 
     @app.post('/api/settings')
     def save_settings(data:dict,user=Depends(admin)):
-        allowed={'mode','main_url','qna_url','poll_seconds','auto_enabled','allowed_categories','budget_krw','smtp_host','smtp_port','smtp_user','smtp_from','smtp_to','smtp_tls',
+        allowed={'mode','main_url','qna_url','poll_seconds','auto_enabled','allowed_categories','reply_rules','budget_krw','smtp_host','smtp_port','smtp_user','smtp_from','smtp_to','smtp_tls',
                  'model','embedding_model','use_environment_key','input_token_krw','output_token_krw','embedding_token_krw'}
         values={k:v for k,v in data.items() if k in allowed}
         for name in ('budget_krw','input_token_krw','output_token_krw','embedding_token_krw'):

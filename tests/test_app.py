@@ -11,6 +11,14 @@ from fastapi.testclient import TestClient
 from app import create_app
 from demo_data import FAQS
 
+TEST_RULES = {
+    'tone': '정중한 한국어 존댓말',
+    'forbidden_phrases': ['무조건 보상'],
+    'required_phrases': [],
+    'blocked_topics': ['환불', '결제', '개인정보'],
+    'exception_policy': '판단이 애매하면 자동 발송하지 않고 담당자에게 전달',
+}
+
 
 @pytest.fixture
 def pair(tmp_path):
@@ -19,6 +27,8 @@ def pair(tmp_path):
         response = client.post('/api/setup', json={'username':'admin','password':'test-password-123'})
         assert response.status_code == 200
         client.headers['X-CSRF-Token'] = response.json()['csrf']
+        response = client.post('/api/settings', json={'reply_rules': TEST_RULES})
+        assert response.status_code == 200
         yield client, app.state.runtime
 
 
@@ -84,6 +94,8 @@ def test_T04_manual_edit_and_concurrent_publish(pair):
     assert all(x['status']=='posted' for x in answers)
     assert answers[0]['external_answer_id']==answers[1]['external_answer_id']
     assert answers[0]['final_answer']==final
+    assert answers[0]['rule_version']==runtime.engine.settings()['rules_version']
+    assert answers[0]['rule_check']=='통과' and answers[0]['human_confirmed']
     candidates=[k for k in runtime.engine.list_knowledge() if k['source_key']==f"reply:{q['id']}"]
     assert len(candidates)==1 and candidates[0]['status']=='candidate'
 
@@ -118,6 +130,28 @@ def test_T06_evaluation_and_automatic_routing(pair):
     bad,_=new_question(client,'제 주문 환불','제 주문을 환불해 주세요','usage')
     assert runtime.engine.question(bad['id'])['status']=='review'
     assert len(runtime.engine.list_knowledge())==20 # no self-learning from an automated reply
+
+
+def test_reply_rules_are_required_and_changes_stop_automation(tmp_path):
+    app=create_app(tmp_path,scheduler=False)
+    with TestClient(app) as client:
+        setup=client.post('/api/setup',json={'username':'admin','password':'test-password-123'}).json()
+        client.headers['X-CSRF-Token']=setup['csrf']
+        assert client.post('/api/evaluate',json={}).status_code==400
+        assert client.post('/api/settings',json={'auto_enabled':True}).status_code==400
+        assert client.post('/api/settings',json={'reply_rules':TEST_RULES}).status_code==200
+        post(client,'/demo/prepare')
+        assert post(client,'/evaluate')['passed']
+        post(client,'/settings',{'auto_enabled':True})
+        changed={**TEST_RULES,'forbidden_phrases':['무조건 보상','새 작업 버튼']}
+        settings=post(client,'/settings',{'reply_rules':changed})
+        assert not settings['auto_enabled'] and not settings['evaluation_passed']
+        post(client,'/sync');q,board=new_question(client);draft(client,q)
+        response=client.post(f"/api/questions/{q['id']}/post",json={'expected_revision':1,'expected_version':q['version']})
+        assert response.status_code==400
+        rejected=app.state.runtime.engine.question(q['id'])
+        assert rejected['rule_version']==settings['rules_version'] and '금지 표현' in rejected['rule_check']
+        assert not next(x for x in app.state.runtime.engine.demo_list() if x['id']==board['id'])['answer']
 
 
 def test_T07_knowledge_invalidates_draft_and_automation(pair):
