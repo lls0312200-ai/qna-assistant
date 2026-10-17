@@ -1,0 +1,4 @@
+# shortcut: 비공개 GitHub Free에서는 CODEOWNERS가 강제되지 않으므로 Pro 전환 후 필수 승인을 켠다.
+* @lls0312200-ai
+/.github/ @lls0312200-ai
+
