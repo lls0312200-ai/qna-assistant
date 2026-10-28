@@ -26,7 +26,8 @@ def dumps(value):
 
 DEFAULTS = {
     "mode": "demo", "main_url": "demo://board", "qna_url": "demo://board/qna",
-    "poll_seconds": 14400, "auto_enabled": False,
+    "poll_seconds": 1800, "auto_enabled": False,
+    "webhook_enabled": True, "last_webhook": None, "webhook_status": "대기 중",
     "allowed_categories": ["usage", "hours", "policy"], "last_sync": None,
     "reply_rules": {"tone": "", "forbidden_phrases": [], "required_phrases": [],
                     "blocked_topics": [], "exception_policy": ""}, "rules_version": 0,
@@ -34,8 +35,13 @@ DEFAULTS = {
     "budget_krw": 30000, "smtp_host": "", "smtp_port": 587,
     "smtp_user": "", "smtp_from": "", "smtp_to": "", "smtp_tls": True,
     "baseline_complete": False, "demo_seeded": False, "evaluation": None,
-    "demo_faults": {"offline": False, "auth": False, "timeout_after_post": False},
+    "demo_faults": {"offline": False, "auth": False, "timeout_after_post": False, "webhook_drop": False},
 }
+
+# Earlier builds polled every 4 hours. Webhooks now deliver new questions immediately,
+# and polling is only a fallback for sites without webhooks or for missed deliveries.
+LEGACY_POLL_SECONDS = 14400
+WEBHOOK_EVENTS = ("question.created", "question.updated")
 
 
 class Engine:
@@ -93,6 +99,7 @@ class Engine:
             if 'human_confirmed' not in question_columns:
                 db.execute('ALTER TABLE questions ADD COLUMN human_confirmed INTEGER NOT NULL DEFAULT 0')
             db.execute("INSERT OR IGNORE INTO settings VALUES(1,?)", (dumps(DEFAULTS),))
+            self.migrate_webhooks(db)
             settings = self._settings(db)
             if not settings.get("demo_seeded"):
                 timestamp = now()
@@ -104,6 +111,17 @@ class Engine:
                                (title, body, category, timestamp, timestamp))
                 settings["demo_seeded"] = True
                 self._put_settings(db, settings)
+
+    def migrate_webhooks(self, db):
+        db.execute("""CREATE TABLE IF NOT EXISTS webhook_events(
+            event_id TEXT PRIMARY KEY,event TEXT NOT NULL,external_id TEXT NOT NULL,status TEXT NOT NULL,
+            error TEXT NOT NULL DEFAULT '',received_at TEXT NOT NULL,processed_at TEXT)""")
+        settings = self._settings(db)
+        if not settings.get("poll_default_migrated"):
+            if int(settings.get("poll_seconds", 0)) == LEGACY_POLL_SECONDS:
+                settings["poll_seconds"] = DEFAULTS["poll_seconds"]
+            settings["poll_default_migrated"] = True
+            self._put_settings(db, settings)
 
     def connect(self):
         db = sqlite3.connect(self.db_path, timeout=30)
@@ -133,6 +151,8 @@ class Engine:
                 raise ValueError("실제 사이트 연동은 아직 제공하지 않습니다. 모의 게시판을 사용해 주세요.")
             if "poll_seconds" in data and not 300 <= int(data["poll_seconds"]) <= 86400:
                 raise ValueError("수집 주기는 300~86,400초여야 합니다.")
+            if "webhook_enabled" in data and not isinstance(data["webhook_enabled"], bool):
+                raise ValueError("웹훅 사용 여부 형식이 올바르지 않습니다.")
             if "allowed_categories" in data:
                 if not isinstance(data["allowed_categories"], list) or not set(data["allowed_categories"]).issubset({"usage", "hours", "policy"}):
                     raise ValueError("허용 범주가 올바르지 않습니다.")
@@ -236,6 +256,9 @@ class Engine:
             settings = self._settings(db)
             return {"counts": counts, "connection_status": settings["connection_status"],
                     "last_sync": settings["last_sync"], "auto_enabled": settings["auto_enabled"],
+                    "webhook_enabled": settings.get("webhook_enabled", True),
+                    "last_webhook": settings.get("last_webhook"), "webhook_status": settings.get("webhook_status"),
+                    "poll_seconds": settings.get("poll_seconds"),
                     "rules_version": settings.get("rules_version", 0),
                     "knowledge_active": len(self._active_knowledge(db)),
                     "notifications": [dict(row) for row in db.execute("SELECT * FROM notifications ORDER BY id DESC LIMIT 10")],
@@ -268,12 +291,68 @@ class Engine:
     def _candidate(self, db, question, answer, source_key):
         if db.execute("SELECT 1 FROM deleted_items WHERE kind='knowledge_source' AND external_id=?", (source_key,)).fetchone():
             return
-        if db.execute("SELECT 1 FROM knowledge WHERE source_key=?", (source_key,)).fetchone():
+        existing = db.execute("SELECT * FROM knowledge WHERE source_key=?", (source_key,)).fetchone()
+        text, answer = redact(self._query(question)), redact(answer)
+        if existing:
+            if (existing["question"], existing["answer"], existing["category"]) != (text, answer, question["category"]):
+                db.execute("UPDATE knowledge SET question=?,answer=?,category=?,status='candidate',auto_allowed=0,approved_by=NULL,version=version+1,updated_at=? WHERE id=?",
+                           (text, answer, question["category"], now(), existing["id"]))
+                self._invalidate(db, existing["id"])
             return
         db.execute("INSERT INTO knowledge(question,answer,category,status,valid_until,source,source_key,updated_at) VALUES(?,?,?,'candidate',?,?,?,?)",
-                   (redact(self._query(question)), redact(answer), question["category"],
+                   (text, answer, question["category"],
                     (datetime.now(timezone.utc) + timedelta(days=90)).isoformat(),
                     "demo://board/qna/" + str(question["external_id"]), source_key, now()))
+
+    def _ingest_row(self, db, board, initial, recovery, actor):
+        """Register or refresh one board question. Shared by polling and webhooks.
+
+        external_id is UNIQUE, so the same question arriving through both paths,
+        or through a redelivered webhook, is stored and answered only once.
+        """
+        outcome = None
+        external_id = str(board["id"])
+        if db.execute("SELECT 1 FROM deleted_items WHERE kind='question' AND external_id=?", (external_id,)).fetchone():
+            return None
+        existing = db.execute("SELECT * FROM questions WHERE external_id=?", (external_id,)).fetchone()
+        if existing is None:
+            status = "external" if board["answer"] else "review"
+            reason = "최초 수집한 과거 문의 · 수동 검토 대상" if initial else ("중단 후 복구 문의 · 수동 검토 대상" if recovery else "새 문의 · 검토 대기")
+            cursor = db.execute("INSERT INTO questions(external_id,title,body,category,status,baseline,recovery,version,final_answer,decision_reason,external_answer_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                                (external_id, board["title"], board["body"], board["category"], status,
+                                 int(initial), int(recovery and not initial), board["version"], board["answer"],
+                                 reason, board["answer_id"], board["created_at"], now()))
+            question_id = cursor.lastrowid
+            outcome = "added"
+            if not initial and not board["answer"]:
+                db.execute("INSERT OR IGNORE INTO notifications(question_id,kind,status,created_at) VALUES(?,'new_question','pending',?)", (question_id, now()))
+            if board["answer"]:
+                self._candidate(db, self._question(db, question_id), board["answer"], "demo:" + external_id)
+        else:
+            question_id = existing["id"]
+            source_changed = board["version"] != existing["version"] or (
+                existing["status"] in ("posted", "external") and
+                (board["answer"], board["answer_id"]) != (existing["final_answer"], existing["external_answer_id"]))
+            if source_changed:
+                db.execute("UPDATE questions SET title=?,body=?,category=?,version=?,draft='',draft_version=NULL,sources='[]',status=?,final_answer=?,external_answer_id=?,decision_reason=?,updated_at=? WHERE id=?",
+                           (board["title"], board["body"], board["category"], board["version"],
+                            "external" if board["answer"] else "review", board["answer"], board["answer_id"],
+                            "문의 또는 답변이 수정되어 다시 검토해야 합니다.", now(), question_id))
+                for record in db.execute("SELECT id FROM knowledge WHERE source_key IN (?,?)",
+                                         ("demo:" + external_id, "reply:" + str(question_id))).fetchall():
+                    db.execute("UPDATE knowledge SET status='inactive',auto_allowed=0,approved_by=NULL,version=version+1,updated_at=? WHERE id=?",
+                               (now(), record["id"]))
+                    self._invalidate(db, record["id"])
+                outcome = "changed"
+            if board["answer"] and (source_changed or existing["status"] not in ("posted", "external")):
+                job = db.execute("SELECT * FROM outbox WHERE question_id=?", (question_id,)).fetchone()
+                if job and board["version"] == job["expected_version"] and board["answer_key"] == job["operation_key"] and board["answer"] == job["answer"]:
+                    self._finish(db, question_id, board, job, actor)
+                else:
+                    db.execute("UPDATE questions SET status='external',final_answer=?,external_answer_id=?,decision_reason=?,updated_at=? WHERE id=?",
+                               (board["answer"], board["answer_id"], "다른 담당자의 답변이 확인되어 발송하지 않았습니다.", now(), question_id))
+                    self._candidate(db, self._question(db, question_id), board["answer"], "demo:" + external_id)
+        return outcome
 
     def sync(self, actor="system", recovery=False):
         with self.lock, closing(self.connect()) as db:
@@ -290,43 +369,69 @@ class Engine:
             added = changed = 0
             with db:
                 for board in db.execute("SELECT * FROM demo_questions ORDER BY id").fetchall():
-                    external_id = str(board["id"])
-                    if db.execute("SELECT 1 FROM deleted_items WHERE kind='question' AND external_id=?", (external_id,)).fetchone():
-                        continue
-                    existing = db.execute("SELECT * FROM questions WHERE external_id=?", (external_id,)).fetchone()
-                    if existing is None:
-                        status = "external" if board["answer"] else "review"
-                        reason = "최초 수집한 과거 문의 · 수동 검토 대상" if initial else ("중단 후 복구 문의 · 수동 검토 대상" if recovery else "새 문의 · 검토 대기")
-                        cursor = db.execute("INSERT INTO questions(external_id,title,body,category,status,baseline,recovery,version,final_answer,decision_reason,external_answer_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                                            (external_id, board["title"], board["body"], board["category"], status,
-                                             int(initial), int(recovery and not initial), board["version"], board["answer"],
-                                             reason, board["answer_id"], board["created_at"], now()))
-                        question_id = cursor.lastrowid
-                        added += 1
-                        if not initial and not board["answer"]:
-                            db.execute("INSERT OR IGNORE INTO notifications(question_id,kind,status,created_at) VALUES(?,'new_question','pending',?)", (question_id, now()))
-                        if board["answer"]:
-                            self._candidate(db, self._question(db, question_id), board["answer"], "demo:" + external_id)
-                    else:
-                        question_id = existing["id"]
-                        if board["version"] != existing["version"]:
-                            db.execute("UPDATE questions SET title=?,body=?,category=?,version=?,draft='',draft_version=NULL,sources='[]',status=?,decision_reason=?,updated_at=? WHERE id=?",
-                                       (board["title"], board["body"], board["category"], board["version"],
-                                        "external" if board["answer"] else "review", "문의가 수정되어 다시 검토해야 합니다.", now(), question_id))
-                            changed += 1
-                        if board["answer"] and existing["status"] not in ("posted", "external"):
-                            job = db.execute("SELECT * FROM outbox WHERE question_id=?", (question_id,)).fetchone()
-                            if job and board["answer_key"] == job["operation_key"] and board["answer"] == job["answer"]:
-                                self._finish(db, question_id, board, job, actor)
-                            else:
-                                db.execute("UPDATE questions SET status='external',final_answer=?,external_answer_id=?,decision_reason=?,updated_at=? WHERE id=?",
-                                           (board["answer"], board["answer_id"], "다른 담당자의 답변이 확인되어 발송하지 않았습니다.", now(), question_id))
+                    outcome = self._ingest_row(db, board, initial, recovery, actor)
+                    added += outcome == "added"
+                    changed += outcome == "changed"
+                settings = self._settings(db)
                 settings["baseline_complete"] = True
                 settings["last_sync"] = now()
                 settings["connection_status"] = "정상 · 모의 게시판"
                 self._put_settings(db, settings)
                 self._audit(db, actor, "sync.complete", detail={"added": added, "changed": changed, "baseline": initial, "recovery": recovery})
             return {"added": added, "changed": changed, "baseline": initial, "recovery": recovery, "last_sync": settings["last_sync"]}
+
+    def record_webhook(self, event_id, event, external_id):
+        """Store a delivery id. Returns False when the site redelivered the same event."""
+        if event not in WEBHOOK_EVENTS:
+            raise ValueError("지원하지 않는 웹훅 이벤트입니다.")
+        with self.lock, closing(self.connect()) as db, db:
+            cursor = db.execute("INSERT OR IGNORE INTO webhook_events(event_id,event,external_id,status,received_at) VALUES(?,?,?,'received',?)",
+                                (event_id, event, str(external_id), now()))
+            if not cursor.rowcount:
+                self._audit(db, "webhook", "webhook.duplicate", external_id, {"event_id": event_id})
+            return bool(cursor.rowcount)
+
+    def finish_webhook(self, event_id, status, error=""):
+        with self.lock, closing(self.connect()) as db, db:
+            db.execute("UPDATE webhook_events SET status=?,error=?,processed_at=? WHERE event_id=?",
+                       (status, error[:500], now(), event_id))
+            settings = self._settings(db)
+            settings["webhook_status"] = "정상" if status == "processed" else "처리 실패 · 주기 확인으로 다시 수집합니다"
+            self._put_settings(db, settings)
+
+    def webhook_events(self, limit=20):
+        with self.lock, closing(self.connect()) as db:
+            return [dict(row) for row in db.execute("SELECT * FROM webhook_events ORDER BY received_at DESC LIMIT ?", (limit,))]
+
+    def ingest(self, external_id, actor="webhook"):
+        """Fetch one question named by a webhook and register it immediately.
+
+        The webhook body only names the question; its content is always read from
+        the board itself, so a forged or stale payload cannot inject text.
+        """
+        with self.lock, closing(self.connect()) as db:
+            settings = self._settings(db)
+            if not settings.get("baseline_complete"):
+                # Before the first full collection every existing question is a past one.
+                return self.sync(actor)
+            try:
+                self._check_connection(settings)
+            except ValueError as exc:
+                with db:
+                    settings["connection_status"] = str(exc)
+                    self._put_settings(db, settings)
+                    self._audit(db, actor, "webhook.fetch_failed", external_id)
+                raise
+            board = db.execute("SELECT * FROM demo_questions WHERE id=?", (str(external_id),)).fetchone()
+            with db:
+                outcome = self._ingest_row(db, board, False, False, actor) if board else None
+                settings = self._settings(db)
+                settings["last_webhook"] = now()
+                settings["connection_status"] = "정상 · 모의 게시판"
+                self._put_settings(db, settings)
+                self._audit(db, actor, "webhook.ingest", external_id, {"outcome": outcome or "unchanged"})
+            return {"added": int(outcome == "added"), "changed": int(outcome == "changed"), "baseline": False,
+                    "recovery": False, "last_webhook": settings["last_webhook"]}
 
     def _active_knowledge(self, db):
         return [self._row(row) for row in db.execute("SELECT * FROM knowledge WHERE status='active' AND valid_until>? ORDER BY id", (now(),))]
@@ -653,7 +758,7 @@ class Engine:
     def demo_update(self, external_id, data):
         fault = data.get("fault") or data.get("name")
         if fault:
-            if fault not in ("offline", "auth", "fail_auth", "timeout_after_post"):
+            if fault not in ("offline", "auth", "fail_auth", "timeout_after_post", "webhook_drop"):
                 raise ValueError("알 수 없는 모의 장애입니다.")
             settings = self.settings()
             faults = {**settings.get("demo_faults", {}), ("auth" if fault == "fail_auth" else fault): bool(data.get("value"))}

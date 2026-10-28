@@ -4,7 +4,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import hmac
 import io
+import re
 import json
 import os
 from pathlib import Path
@@ -13,6 +15,7 @@ import smtplib
 import sqlite3
 import ssl
 import time
+import uuid
 import zipfile
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
@@ -20,18 +23,29 @@ from urllib.parse import urlsplit
 
 from cryptography.fernet import Fernet, InvalidToken
 import base64
-from fastapi import FastAPI, Request, HTTPException, Depends
+from fastapi import BackgroundTasks, FastAPI, Request, HTTPException, Depends
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from engine import Engine
+from engine import Engine, WEBHOOK_EVENTS
 from rag import AIClient, blocked_reason
 from security import hash_password, verify_password, load_master_key, encrypt_secret, decrypt_secret
 
 ROOT = Path(__file__).resolve().parent
 COOKIE = 'qna_session'
 SAFE = {'GET', 'HEAD', 'OPTIONS'}
+WEBHOOK_PATH = '/api/webhook/board'
+WEBHOOK_TOLERANCE_SECONDS = 300
+WEBHOOK_MAX_BYTES = 16_384
+EVENT_ID = re.compile(r'^[A-Za-z0-9_-]{8,100}$')
+EXTERNAL_ID = re.compile(r'^[A-Za-z0-9_-]{1,64}$')
+
+
+def sign_webhook(secret, timestamp, body):
+    """HMAC-SHA256 over "<timestamp>.<raw body>", sent as X-QnA-Signature: sha256=<hex>."""
+    digest = hmac.new(secret.encode(), str(timestamp).encode() + b'.' + body, hashlib.sha256).hexdigest()
+    return 'sha256=' + digest
 
 
 def utcnow():
@@ -52,6 +66,7 @@ class Runtime:
         self.started = utcnow()
         self.scheduler_error = ''
         self.last_backup = ''
+        self.next_poll = ''
         with contextlib.closing(self.engine.connect()) as db, db:
             db.executescript('''
                 CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY,username TEXT NOT NULL UNIQUE,
@@ -62,7 +77,83 @@ class Runtime:
                     amount REAL NOT NULL,status TEXT NOT NULL,input_tokens INTEGER NOT NULL DEFAULT 0,
                     output_tokens INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL);
             ''')
+        self.webhook_secret()
         self.configure_ai()
+
+    def webhook_secret(self):
+        # Created on first use; also covers a restore from a backup made before webhooks existed.
+        encrypted = self.engine.settings().get('webhook_secret_encrypted')
+        if not encrypted:
+            secret = secrets.token_urlsafe(32)
+            self.internal_settings({'webhook_secret_encrypted': encrypt_secret(secret, self.key)})
+            return secret
+        return decrypt_secret(encrypted, self.key)
+
+    def rotate_webhook_secret(self, actor):
+        secret = secrets.token_urlsafe(32)
+        self.internal_settings({'webhook_secret_encrypted': encrypt_secret(secret, self.key)})
+        self.audit(actor, 'webhook.secret_rotated')
+        return secret
+
+    def receive_webhook(self, body, headers):
+        """Verify and record one delivery. Returns (event_id, external_id, is_new).
+
+        Raises HTTPException for anything that is not a fresh, correctly signed event.
+        Content is never taken from the body: only the question id is used.
+        """
+        if not self.engine.settings().get('webhook_enabled', True):
+            raise HTTPException(403, '웹훅 수신이 꺼져 있습니다.')
+        if len(body) > WEBHOOK_MAX_BYTES:
+            raise HTTPException(413, '웹훅 본문이 너무 큽니다.')
+        timestamp, signature = headers.get('x-qna-timestamp', ''), headers.get('x-qna-signature', '')
+        event_id = headers.get('x-qna-event-id', '')
+        if (not re.fullmatch(r'[0-9]{1,12}', timestamp)
+                or not re.fullmatch(r'sha256=[0-9a-f]{64}', signature)
+                or not EVENT_ID.fullmatch(event_id)):
+            raise HTTPException(401, '웹훅 서명 정보가 없습니다.')
+        if abs(time.time() - int(timestamp)) > WEBHOOK_TOLERANCE_SECONDS:
+            raise HTTPException(401, '웹훅 시각이 허용 범위를 벗어났습니다.')
+        if not hmac.compare_digest(sign_webhook(self.webhook_secret(), timestamp, body), signature):
+            self.audit('webhook', 'webhook.rejected', event_id, 'invalid signature')
+            raise HTTPException(401, '웹훅 서명이 올바르지 않습니다.')
+        try:
+            payload = json.loads(body)
+            event, external_id = payload['event'], str(payload['external_id'])
+        except (ValueError, KeyError, TypeError):
+            raise HTTPException(400, '웹훅 본문 형식이 올바르지 않습니다.') from None
+        if event not in WEBHOOK_EVENTS or not EXTERNAL_ID.fullmatch(external_id):
+            raise HTTPException(400, '지원하지 않는 웹훅 이벤트입니다.')
+        return event_id, external_id, self.engine.record_webhook(event_id, event, external_id)
+
+    def process_webhook(self, event_id, external_id):
+        with self.engine.lock:
+            try:
+                self.engine.ingest(external_id)
+                if self.engine.settings().get('auto_enabled'):
+                    self.engine.auto_process()
+                self.engine.finish_webhook(event_id, 'processed')
+            except Exception as exc:
+                # Not retried here: the next scheduled poll scans the whole board.
+                self.engine.finish_webhook(event_id, 'failed', str(exc) if isinstance(exc, ValueError) else type(exc).__name__)
+
+    def deliver_demo_webhook(self, event, external_id):
+        """The mock board plays the external site: it signs and sends a webhook."""
+        settings = self.engine.settings()
+        if not settings.get('webhook_enabled', True):
+            return
+        if settings.get('demo_faults', {}).get('webhook_drop'):
+            self.audit('demo', 'webhook.dropped', external_id, '모의 장애 · 주기 확인에서 수집됩니다')
+            return
+        body = json.dumps({'event': event, 'external_id': str(external_id)}).encode()
+        timestamp = str(int(time.time()))
+        headers = {'x-qna-timestamp': timestamp, 'x-qna-event-id': 'demo-' + uuid.uuid4().hex,
+                   'x-qna-signature': sign_webhook(self.webhook_secret(), timestamp, body)}
+        try:
+            event_id, ident, is_new = self.receive_webhook(body, headers)
+        except HTTPException:
+            return
+        if is_new:
+            self.process_webhook(event_id, ident)
 
     def audit(self, actor, action, target='', detail=''):
         with contextlib.closing(self.engine.connect()) as db, db:
@@ -128,7 +219,8 @@ class Runtime:
                       data_dir=str(self.folder), mode='demo',
                       external_unavailable_reason='사용자 요청에 따라 모의 게시판만 지원합니다. 실제 사이트가 준비되면 전용 연결 모듈을 추가합니다.',
                       usage=self.usage_summary(), ai_mode='openai' if self.engine.ai else 'demo',
-                      scheduler_error=self.scheduler_error)
+                      scheduler_error=self.scheduler_error, webhook_path=WEBHOOK_PATH, next_poll=self.next_poll,
+                      webhook_events=self.engine.webhook_events(10))
         return values
 
     def backup(self, actor='system'):
@@ -173,6 +265,9 @@ class Runtime:
                 # Password and usage records must never roll back with a content restore.
                 current_users = [dict(r) for r in db.execute('SELECT * FROM users')]
                 current_usage = [dict(r) for r in db.execute('SELECT * FROM usage')]
+                current_webhooks = [dict(r) for r in db.execute('SELECT * FROM webhook_events')]
+                webhook_settings = {k: v for k, v in self.engine._settings(db).items()
+                                    if k in ('webhook_secret_encrypted', 'webhook_enabled', 'last_webhook', 'webhook_status')}
                 sequences = {r['name']: r['seq'] for r in db.execute('SELECT * FROM sqlite_sequence')}
             snapshot = self.folder / ('.restore-' + secrets.token_hex(8))
             try:
@@ -183,19 +278,23 @@ class Runtime:
                     with contextlib.closing(self.engine.connect()) as target:
                         source.backup(target)
                 with contextlib.closing(self.engine.connect()) as db, db:
+                    self.engine.migrate_webhooks(db)
                     db.execute('DELETE FROM sessions')
                     db.execute('DELETE FROM users')
                     for row in current_users:
                         db.execute('INSERT INTO users(id,username,password_hash,role,active,created_at) VALUES(?,?,?,?,?,?)', tuple(row[k] for k in ('id','username','password_hash','role','active','created_at')))
                     for row in current_usage:
                         db.execute('INSERT OR REPLACE INTO usage(id,month,kind,amount,status,input_tokens,output_tokens,created_at) VALUES(?,?,?,?,?,?,?,?)', tuple(row[k] for k in ('id','month','kind','amount','status','input_tokens','output_tokens','created_at')))
+                    for row in current_webhooks:
+                        db.execute('INSERT OR REPLACE INTO webhook_events(event_id,event,external_id,status,error,received_at,processed_at) VALUES(?,?,?,?,?,?,?)', tuple(row[k] for k in ('event_id','event','external_id','status','error','received_at','processed_at')))
                     for table, number in sequences.items():
                         existing = db.execute('SELECT seq FROM sqlite_sequence WHERE name=?', (table,)).fetchone()
                         if existing:
                             db.execute('UPDATE sqlite_sequence SET seq=MAX(seq,?) WHERE name=?', (number, table))
                         else:
                             db.execute('INSERT INTO sqlite_sequence(name,seq) VALUES(?,?)', (table, number))
-                self.internal_settings({'auto_enabled': False, 'evaluation_passed': False})
+                # Restoring content must not revive revoked webhook secrets or replay old deliveries.
+                self.internal_settings({**webhook_settings, 'auto_enabled': False, 'evaluation_passed': False})
                 # Apply privacy changes with offline indexing: a paid API outage must not undo deletion.
                 self.engine.ai = self.engine.rag.ai = None
                 self.engine.apply_tombstones(deleted)
@@ -305,8 +404,10 @@ def create_app(data_dir=None, scheduler=True):
                 try:
                     await asyncio.wait_for(stop.wait(), timeout=10)
                 except asyncio.TimeoutError:
-                    seconds = max(300, min(86400, int(engine.settings().get('poll_seconds', 14400))))
-                    if time.monotonic() - last_tick >= seconds:
+                    seconds = max(300, min(86400, int(engine.settings().get('poll_seconds', 1800))))
+                    elapsed = time.monotonic() - last_tick
+                    runtime.next_poll = (datetime.now(timezone.utc) + timedelta(seconds=max(0, seconds - elapsed))).isoformat()
+                    if elapsed >= seconds:
                         await asyncio.to_thread(runtime.tick)
                         last_tick = time.monotonic()
                     else:
@@ -433,7 +534,7 @@ def create_app(data_dir=None, scheduler=True):
     @app.get('/api/dashboard')
     def dashboard(user=Depends(authorized)):
         data=engine.dashboard()
-        data.update(usage=runtime.usage_summary(),ai_mode='openai' if engine.ai else 'demo',started_at=runtime.started,scheduler_error=runtime.scheduler_error)
+        data.update(usage=runtime.usage_summary(),ai_mode='openai' if engine.ai else 'demo',started_at=runtime.started,scheduler_error=runtime.scheduler_error,next_poll=runtime.next_poll)
         return data
 
     @app.get('/api/questions')
@@ -499,7 +600,7 @@ def create_app(data_dir=None, scheduler=True):
 
     @app.post('/api/settings')
     def save_settings(data:dict,user=Depends(admin)):
-        allowed={'mode','main_url','qna_url','poll_seconds','auto_enabled','allowed_categories','reply_rules','budget_krw','smtp_host','smtp_port','smtp_user','smtp_from','smtp_to','smtp_tls',
+        allowed={'mode','main_url','qna_url','poll_seconds','webhook_enabled','auto_enabled','allowed_categories','reply_rules','budget_krw','smtp_host','smtp_port','smtp_user','smtp_from','smtp_to','smtp_tls',
                  'model','embedding_model','use_environment_key','input_token_krw','output_token_krw','embedding_token_krw'}
         values={k:v for k,v in data.items() if k in allowed}
         for name in ('budget_krw','input_token_krw','output_token_krw','embedding_token_krw'):
@@ -547,6 +648,26 @@ def create_app(data_dir=None, scheduler=True):
         if engine.settings().get('auto_enabled'):
             result['automation']=engine.auto_process()
         return result
+
+    @app.post(WEBHOOK_PATH, status_code=202)
+    async def webhook(request: Request, tasks: BackgroundTasks):
+        # Server-to-server call: no session or CSRF token. The HMAC signature,
+        # timestamp window and event id replace them. Reply fast, process after.
+        body = bytearray()
+        async for chunk in request.stream():
+            if len(body) + len(chunk) > WEBHOOK_MAX_BYTES:
+                raise HTTPException(413, '웹훅 본문이 너무 큽니다.')
+            body.extend(chunk)
+        body = bytes(body)
+        event_id, external_id, is_new = await asyncio.to_thread(runtime.receive_webhook, body, request.headers)
+        if is_new:
+            tasks.add_task(runtime.process_webhook, event_id, external_id)
+        return {'accepted': True, 'duplicate': not is_new}
+
+    @app.post('/api/webhook/secret')
+    def webhook_secret(user=Depends(admin)):
+        return {'secret': runtime.rotate_webhook_secret(user['username']), 'path': WEBHOOK_PATH,
+                'message': '새 비밀값은 지금만 표시됩니다. 연동할 사이트의 웹훅 설정에 입력하세요.'}
 
     @app.post('/api/evaluate')
     def evaluate(user=Depends(admin)):
@@ -633,19 +754,23 @@ def create_app(data_dir=None, scheduler=True):
         return engine.demo_list()
 
     @app.post('/api/demo')
-    def demo_create(data:dict,user=Depends(authorized)):
+    def demo_create(data:dict,tasks:BackgroundTasks,user=Depends(authorized)):
         title,body=str(data.get('title','')).strip(),str(data.get('body','')).strip()
         if not title or not body or len(title)>200 or len(body)>12000:
             raise ValueError('제목(200자 이하)과 문의 내용(12,000자 이하)을 입력하세요.')
-        return engine.demo_create(title,body,str(data.get('category','usage')))
+        row=engine.demo_create(title,body,str(data.get('category','usage')))
+        tasks.add_task(runtime.deliver_demo_webhook,'question.created',row['id'])
+        return row
 
     @app.patch('/api/demo/{ident}')
-    def demo_edit(ident:int,data:dict,user=Depends(authorized)):
-        return engine.demo_update(ident,{k:str(v) for k,v in data.items() if k in ('body','answer','title','category')})
+    def demo_edit(ident:int,data:dict,tasks:BackgroundTasks,user=Depends(authorized)):
+        row=engine.demo_update(ident,{k:str(v) for k,v in data.items() if k in ('body','answer','title','category')})
+        tasks.add_task(runtime.deliver_demo_webhook,'question.updated',ident)
+        return row
 
     @app.post('/api/demo/fault')
     def demo_fault(data:dict,user=Depends(admin)):
-        if data.get('name') not in ('offline','auth','timeout_after_post'):
+        if data.get('name') not in ('offline','auth','timeout_after_post','webhook_drop'):
             raise ValueError('지원하지 않는 장애 유형입니다.')
         return engine.demo_update(0,{'fault':data['name'],'value':bool(data.get('value'))})
 
