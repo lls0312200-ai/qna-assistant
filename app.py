@@ -56,6 +56,15 @@ def default_data_dir():
     return Path(os.environ.get('QNA_DATA_DIR') or str(Path(os.environ.get('LOCALAPPDATA', str(Path.home() / '.local' / 'share'))) / 'QnaAssistant'))
 
 
+def validate_account(data):
+    name, password = str(data.get('username', '')).strip(), str(data.get('password', ''))
+    if not 2 <= len(name) <= 40 or any(c.isspace() for c in name):
+        raise ValueError('아이디는 공백 없이 2~40자로 입력하세요.')
+    if not 10 <= len(password) <= 128:
+        raise ValueError('비밀번호는 10~128자로 입력하세요.')
+    return name, password
+
+
 class Runtime:
     def __init__(self, folder):
         self.folder = Path(folder)
@@ -79,6 +88,20 @@ class Runtime:
             ''')
         self.webhook_secret()
         self.configure_ai()
+
+    def setup_required(self):
+        with contextlib.closing(self.engine.connect()) as db:
+            return db.execute('SELECT COUNT(*) FROM users').fetchone()[0] == 0
+
+    def initialize_admin(self, username, password):
+        name, password = validate_account({'username': username, 'password': password})
+        with self.engine.lock, contextlib.closing(self.engine.connect()) as db, db:
+            if db.execute('SELECT COUNT(*) FROM users').fetchone()[0]:
+                raise ValueError('이미 초기 관리자 등록이 완료되었습니다. 기존 계정으로 로그인하세요.')
+            ident = db.execute('INSERT INTO users(username,password_hash,role,created_at) VALUES(?,?,?,?)',
+                               (name, hash_password(password), 'admin', utcnow())).lastrowid
+        self.audit(name, 'setup.local', ident)
+        return {'id': ident, 'username': name, 'role': 'admin'}
 
     def webhook_secret(self):
         # Created on first use; also covers a restore from a backup made before webhooks existed.
@@ -472,10 +495,8 @@ def create_app(data_dir=None, scheduler=True):
         return user
 
     def me_data(request):
-        with contextlib.closing(engine.connect()) as db, db:
-            empty = db.execute('SELECT COUNT(*) FROM users').fetchone()[0] == 0
         user = session(request)
-        return {'setup_required': empty, 'user': {k:v for k,v in user.items() if k != 'csrf'} if user else None, 'csrf': user['csrf'] if user else None}
+        return {'setup_required': runtime.setup_required(), 'user': {k:v for k,v in user.items() if k != 'csrf'} if user else None, 'csrf': user['csrf'] if user else None}
 
     def create_session(user):
         token, csrf = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
@@ -485,27 +506,13 @@ def create_app(data_dir=None, scheduler=True):
         response.set_cookie(COOKIE, token, max_age=8*3600, httponly=True, samesite='strict', path='/')
         return response
 
-    def validate_account(data):
-        name, password = str(data.get('username', '')).strip(), str(data.get('password', ''))
-        if not 2 <= len(name) <= 40 or any(c.isspace() for c in name):
-            raise ValueError('아이디는 공백 없이 2~40자로 입력하세요.')
-        if not 10 <= len(password) <= 128:
-            raise ValueError('비밀번호는 10~128자로 입력하세요.')
-        return name, password
-
     @app.get('/api/me')
     def me(request: Request):
         return me_data(request)
 
     @app.post('/api/setup')
-    def setup(data: dict):
-        name, password = validate_account(data)
-        with engine.lock, contextlib.closing(engine.connect()) as db, db:
-            if db.execute('SELECT COUNT(*) FROM users').fetchone()[0]:
-                raise HTTPException(409, '이미 초기 설정이 완료되었습니다.')
-            ident = db.execute('INSERT INTO users(username,password_hash,role,created_at) VALUES(?,?,?,?)', (name,hash_password(password),'admin',utcnow())).lastrowid
-        runtime.audit(name,'setup',ident)
-        return create_session({'id':ident,'username':name,'role':'admin'})
+    def setup():
+        raise HTTPException(403, '웹에서는 최초 관리자 계정을 등록할 수 없습니다. 서비스 관리자에게 문의하세요.')
 
     @app.post('/api/login')
     def login(request: Request, data: dict):
