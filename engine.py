@@ -236,6 +236,12 @@ class Engine:
     def question(self, question_id):
         with self.lock, closing(self.connect()) as db:
             item = self._question(db, question_id)
+        if item['status'] in ('posted', 'external'):
+            # A current search cannot describe which evidence a completed answer used.
+            item['matches'], item['search_error'] = [], None
+            if item['status'] == 'external':
+                item['sources'] = []
+            return item
         try:
             item["matches"] = self.search_knowledge(self._query(item))
             item["search_error"] = None
@@ -526,7 +532,8 @@ class Engine:
 
     def _snapshot(self, matches):
         return [{"id": item["id"], "version": item["version"], "question": item["question"],
-                 "answer": item["answer"], "source": item.get("source", ""), "score": item.get("score", 0)} for item in matches]
+                 "answer": item["answer"], "source": item.get("source", ""), "score": item.get("score", 0),
+                 "category": item.get("category", "other")} for item in matches]
 
     def save_draft(self, question_id, conclusion, reason, draft, actor):
         if not str(draft).strip() or len(str(draft)) > 20000:
@@ -568,8 +575,8 @@ class Engine:
                 raise ValueError("초안의 근거가 변경·만료·삭제되었습니다. 초안을 다시 검토하고 저장해 주세요.")
 
     def _finish(self, db, question_id, board, job, actor):
-        db.execute("UPDATE questions SET status='posted',final_answer=?,external_answer_id=?,decision_reason=?,updated_at=? WHERE id=?",
-                   (board["answer"], board["answer_id"], "승인 FAQ 자동 게시 확인" if job["auto"] else "담당자 승인 게시 확인", now(), question_id))
+        db.execute("UPDATE questions SET status='posted',final_answer=?,external_answer_id=?,sources=?,decision_reason=?,updated_at=? WHERE id=?",
+                   (board["answer"], board["answer_id"], job["sources"], "승인 FAQ 자동 게시 확인" if job["auto"] else "담당자 승인 게시 확인", now(), question_id))
         db.execute("UPDATE outbox SET status='posted',external_answer_id=?,updated_at=? WHERE question_id=?", (board["answer_id"], now(), question_id))
         if job["knowledge_candidate"]:
             self._candidate(db, self._question(db, question_id), board["answer"], "reply:" + str(question_id))
