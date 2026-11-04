@@ -52,6 +52,7 @@ class Engine:
         # ponytail: one local process; use a worker queue if deployment grows.
         self.lock = threading.RLock()
         self.ai = ai
+        self.board = None
         self.rag = RAG(self.data_dir, load_master_key(self.data_dir), ai=ai)
         with self.lock, closing(self.connect()) as db, db:
             db.executescript("""
@@ -143,8 +144,8 @@ class Engine:
     def update_settings(self, data, actor):
         with self.lock, closing(self.connect()) as db, db:
             settings = self._settings(db)
-            if data.get("mode", "demo") != "demo":
-                raise ValueError("실제 사이트 연동은 아직 제공하지 않습니다. 모의 게시판을 사용해 주세요.")
+            if data.get("mode", settings.get("mode", "demo")) not in ("demo", "shop"):
+                raise ValueError("지원하지 않는 연결 방식입니다.")
             if "poll_seconds" in data and not 300 <= int(data["poll_seconds"]) <= 86400:
                 raise ValueError("수집 주기는 300~86,400초여야 합니다.")
             if "webhook_enabled" in data and not isinstance(data["webhook_enabled"], bool):
@@ -186,6 +187,8 @@ class Engine:
                     data["auto_enabled"] = False
             prospective = {**settings, **data}
             if data.get("auto_enabled"):
+                if prospective.get("mode") == "shop":
+                    raise ValueError("쇼핑몰 데이터의 의미·조건 기반 자동 답변은 별도 검증 후 활성화할 수 있습니다.")
                 if not reply_rules_ready(prospective):
                     raise ValueError("답변 규칙을 저장한 후 자동 모드를 켤 수 있습니다.")
                 if not prospective.get("evaluation_passed"):
@@ -193,7 +196,6 @@ class Engine:
                 if not self._active_knowledge(db):
                     raise ValueError("승인된 활성 지식이 필요합니다.")
             settings.update(data)
-            settings["mode"] = "demo"
             self._put_settings(db, settings)
             if rules_changed:
                 db.execute("UPDATE questions SET status='review',draft_version=NULL,decision_reason=?,updated_at=? WHERE status='draft'",
@@ -232,6 +234,8 @@ class Engine:
     def question(self, question_id):
         with self.lock, closing(self.connect()) as db:
             item = self._question(db, question_id)
+        if str(item["external_id"]).startswith("shop-") and self.board:
+            item["source_url"] = self.board.url + "/?question=" + item["external_id"]
         try:
             item["matches"] = self.search_knowledge(self._query(item))
             item["search_error"] = None
@@ -259,9 +263,14 @@ class Engine:
                     "knowledge_active": len(self._active_knowledge(db)),
                     "notifications": [dict(row) for row in db.execute("SELECT * FROM notifications ORDER BY id DESC LIMIT 10")],
                     "questions": [self._row(row) for row in db.execute("SELECT * FROM questions ORDER BY id DESC LIMIT 8")],
-                    "evaluation": settings.get("evaluation"), "mode": "demo"}
+                    "evaluation": settings.get("evaluation"), "mode": settings.get("mode", "demo"),
+                    "customer_url": settings.get("shop_url", "")}
 
     def _check_connection(self, settings):
+        if settings.get("mode") == "shop":
+            if self.board is None:
+                raise ValueError("모의 고객사이트 연결 설정을 확인해 주세요.")
+            return
         if settings.get("mode") != "demo":
             raise ValueError("실제 사이트용 연결 모듈이 없습니다.")
         faults = settings.get("demo_faults", {})
@@ -275,14 +284,27 @@ class Engine:
             settings = self._settings(db)
             try:
                 self._check_connection(settings)
-                settings["connection_status"] = "정상 · 모의 게시판"
+                if settings.get("mode") == "shop":
+                    self.board.list_questions()
+                settings["connection_status"] = self._connection_label(settings)
                 ok = True
             except ValueError as exc:
                 settings["connection_status"] = str(exc)
                 ok = False
             self._put_settings(db, settings)
             self._audit(db, actor, "connection.test", detail={"ok": ok, "mode": "demo"})
-            return {"ok": ok, "status": settings["connection_status"], "mode": "demo"}
+            return {"ok": ok, "status": settings["connection_status"], "mode": settings.get("mode", "demo")}
+
+    @staticmethod
+    def _connection_label(settings):
+        return "정상 · MORU 고객사이트" if settings.get("mode") == "shop" else "정상 · 모의 게시판"
+
+    def _board_question(self, db, external_id):
+        if str(external_id).startswith("shop-"):
+            if self.board is None:
+                raise ValueError("고객사이트 연결 설정을 확인해 주세요.")
+            return self.board.question(str(external_id))
+        return db.execute("SELECT * FROM demo_questions WHERE id=?", (str(external_id),)).fetchone()
 
     def _candidate(self, db, question, answer, source_key):
         if db.execute("SELECT 1 FROM deleted_items WHERE kind='knowledge_source' AND external_id=?", (source_key,)).fetchone():
@@ -292,7 +314,7 @@ class Engine:
         db.execute("INSERT INTO knowledge(question,answer,category,status,valid_until,source,source_key,updated_at) VALUES(?,?,?,'candidate',?,?,?,?)",
                    (redact(self._query(question)), redact(answer), question["category"],
                     (datetime.now(timezone.utc) + timedelta(days=90)).isoformat(),
-                    "demo://board/qna/" + str(question["external_id"]), source_key, now()))
+                    (self.board.url + "/?question=" + str(question["external_id"])) if str(question["external_id"]).startswith("shop-") and self.board else "demo://board/qna/" + str(question["external_id"]), source_key, now()))
 
     def _ingest_row(self, db, board, initial, recovery, actor):
         """Register or refresh one board question. Shared by polling and webhooks.
@@ -348,13 +370,14 @@ class Engine:
             initial = not settings.get("baseline_complete")
             added = changed = 0
             with db:
-                for board in db.execute("SELECT * FROM demo_questions ORDER BY id").fetchall():
+                boards = self.board.list_questions() if settings.get("mode") == "shop" else db.execute("SELECT * FROM demo_questions ORDER BY id").fetchall()
+                for board in boards:
                     outcome = self._ingest_row(db, board, initial, recovery, actor)
                     added += outcome == "added"
                     changed += outcome == "changed"
                 settings["baseline_complete"] = True
                 settings["last_sync"] = now()
-                settings["connection_status"] = "정상 · 모의 게시판"
+                settings["connection_status"] = self._connection_label(settings)
                 self._put_settings(db, settings)
                 self._audit(db, actor, "sync.complete", detail={"added": added, "changed": changed, "baseline": initial, "recovery": recovery})
             return {"added": added, "changed": changed, "baseline": initial, "recovery": recovery, "last_sync": settings["last_sync"]}
@@ -401,11 +424,11 @@ class Engine:
                     self._put_settings(db, settings)
                     self._audit(db, actor, "webhook.fetch_failed", external_id)
                 raise
-            board = db.execute("SELECT * FROM demo_questions WHERE id=?", (str(external_id),)).fetchone()
+            board = self._board_question(db, external_id)
             with db:
                 outcome = self._ingest_row(db, board, False, False, actor) if board else None
                 settings["last_webhook"] = now()
-                settings["connection_status"] = "정상 · 모의 게시판"
+                settings["connection_status"] = self._connection_label(settings)
                 self._put_settings(db, settings)
                 self._audit(db, actor, "webhook.ingest", external_id, {"outcome": outcome or "unchanged"})
             return {"added": int(outcome == "added"), "changed": int(outcome == "changed"), "baseline": False,
@@ -453,7 +476,7 @@ class Engine:
             if not is_admin and (status != "candidate" or current.get("status") == "active"):
                 raise ValueError("활성 지식의 승인·수정은 관리자만 가능합니다.")
             category = item.get("category", "usage")
-            if category not in ("usage", "hours", "policy", "refund", "account", "other"):
+            if category not in ("usage", "hours", "policy", "refund", "account", "other", "배송", "교환반품", "사이즈", "상품", "환불", "결제", "적립금", "회원", "기타"):
                 raise ValueError("범주가 올바르지 않습니다.")
             valid_until = item.get("valid_until") or (datetime.now(timezone.utc) + timedelta(days=90)).isoformat()
             try:
@@ -564,9 +587,9 @@ class Engine:
                 raise ValueError("게시판에 이미 답변이 있습니다.")
             settings = self._settings(db)
             self._check_connection(settings)
-            board = db.execute("SELECT * FROM demo_questions WHERE id=?", (question["external_id"],)).fetchone()
+            board = self._board_question(db, question["external_id"])
             if not board:
-                raise ValueError("모의 게시판의 문의가 삭제되었습니다.")
+                raise ValueError("게시판의 문의를 찾을 수 없습니다.")
             if board["answer"]:
                 with db:
                     db.execute("UPDATE questions SET status='external',final_answer=?,external_answer_id=?,decision_reason=?,updated_at=? WHERE id=?",
@@ -601,6 +624,23 @@ class Engine:
                            (int(settings.get("rules_version", 0)), "통과", int(not auto), now(), question_id))
                 self._audit(db, actor, "answer.approved", question_id,
                             {"auto": auto, "rules_version": int(settings.get("rules_version", 0)), "rule_check": "passed"})
+            if str(question["external_id"]).startswith("shop-"):
+                with db:
+                    db.execute("UPDATE outbox SET attempts=attempts+1 WHERE question_id=?", (question_id,))
+                try:
+                    fresh_board = self.board.answer(question["external_id"], question["draft"], operation_key, board["version"])
+                    if fresh_board.get("answer_key") != operation_key or fresh_board["answer"] != question["draft"]:
+                        raise ValueError("고객사이트 게시 결과를 대조할 수 없습니다.")
+                except ValueError:
+                    with db:
+                        db.execute("UPDATE questions SET status='confirm',decision_reason=?,updated_at=? WHERE id=?", ("고객사이트 게시 결과 확인 필요 · 재전송 전 대조해 주세요.", now(), question_id))
+                        db.execute("UPDATE outbox SET status='confirm',updated_at=? WHERE question_id=?", (now(), question_id))
+                        self._audit(db, actor, "answer.uncertain", question_id)
+                else:
+                    with db:
+                        job = db.execute("SELECT * FROM outbox WHERE question_id=?", (question_id,)).fetchone()
+                        self._finish(db, question_id, fresh_board, job, actor)
+                return self._question(db, question_id)
             # The mock site commits independently before the response is observed.
             # An app crash after this commit is resolved via operation_key, never reposted.
             with db:
@@ -630,7 +670,7 @@ class Engine:
             job = db.execute("SELECT * FROM outbox WHERE question_id=?", (question_id,)).fetchone()
             if not job:
                 raise ValueError("확인할 발송 작업이 없습니다.")
-            board = db.execute("SELECT * FROM demo_questions WHERE id=?", (question["external_id"],)).fetchone()
+            board = self._board_question(db, question["external_id"])
             if board and board["answer_key"] == job["operation_key"] and board["answer"] == job["answer"]:
                 self._finish(db, question_id, board, job, actor)
             elif board and board["answer"]:

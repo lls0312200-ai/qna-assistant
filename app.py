@@ -79,6 +79,15 @@ class Runtime:
             ''')
         self.webhook_secret()
         self.configure_ai()
+        self.configure_board()
+
+    def configure_board(self):
+        settings = self.engine.settings()
+        if settings.get('mode') == 'shop' and settings.get('shop_token_encrypted'):
+            from shop_connector import ShopBoard
+            self.engine.board = ShopBoard(settings['shop_url'], decrypt_secret(settings['shop_token_encrypted'], self.key))
+        else:
+            self.engine.board = None
 
     def webhook_secret(self):
         # Created on first use; also covers a restore from a backup made before webhooks existed.
@@ -91,6 +100,9 @@ class Runtime:
 
     def rotate_webhook_secret(self, actor):
         secret = secrets.token_urlsafe(32)
+        if self.engine.board is not None:
+            self.engine.board.request('PUT', '/integration/webhook',
+                                      {'url':'http://127.0.0.1:8765/api/webhook/board','secret':secret})
         self.internal_settings({'webhook_secret_encrypted': encrypt_secret(secret, self.key)})
         self.audit(actor, 'webhook.secret_rotated')
         return secret
@@ -214,8 +226,8 @@ class Runtime:
                   if not any(word in k.lower() for word in ('password', 'secret', 'encrypted', 'api_key', 'token'))}
         values.update(api_configured=self.engine.ai is not None,
                       smtp_configured=bool(values.get('smtp_host') and values.get('smtp_to')),
-                      data_dir=str(self.folder), mode='demo',
-                      external_unavailable_reason='사용자 요청에 따라 모의 게시판만 지원합니다. 실제 사이트가 준비되면 전용 연결 모듈을 추가합니다.',
+                      data_dir=str(self.folder),
+                      external_unavailable_reason='독립된 MORU 모의 고객사이트와 HTTP API로 연결되어 있습니다.' if values.get('mode') == 'shop' else '내장 모의 게시판입니다. MORU 고객사이트는 별도 서버에서 실행합니다.',
                       usage=self.usage_summary(), ai_mode='openai' if self.engine.ai else 'demo',
                       scheduler_error=self.scheduler_error, webhook_path=WEBHOOK_PATH, next_poll=self.next_poll,
                       webhook_events=self.engine.webhook_events(10))
@@ -290,6 +302,7 @@ class Runtime:
                 self.engine.ai = self.engine.rag.ai = None
                 self.engine.apply_tombstones(deleted)
                 self.configure_ai()
+                self.configure_board()
                 self.audit(actor, 'restore', name, '자동 모드 중단, 현재 사용자/사용량/삭제 기록 유지, 세션 종료')
             finally:
                 snapshot.unlink(missing_ok=True)
@@ -627,6 +640,7 @@ def create_app(data_dir=None, scheduler=True):
                 sensitive['evaluation_passed']=False
             runtime.internal_settings(sensitive)
             runtime.configure_ai()
+            runtime.configure_board()
         return runtime.safe_settings()
 
     @app.post('/api/connection/test')
