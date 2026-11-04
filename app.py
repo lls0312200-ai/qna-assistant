@@ -56,6 +56,15 @@ def default_data_dir():
     return Path(os.environ.get('QNA_DATA_DIR') or str(Path(os.environ.get('LOCALAPPDATA', str(Path.home() / '.local' / 'share'))) / 'QnaAssistant'))
 
 
+def validate_account(data):
+    name, password = str(data.get('username', '')).strip(), str(data.get('password', ''))
+    if not 2 <= len(name) <= 40 or any(c.isspace() for c in name):
+        raise ValueError('아이디는 공백 없이 2~40자로 입력하세요.')
+    if not 10 <= len(password) <= 128:
+        raise ValueError('비밀번호는 10~128자로 입력하세요.')
+    return name, password
+
+
 class Runtime:
     def __init__(self, folder):
         self.folder = Path(folder)
@@ -89,6 +98,20 @@ class Runtime:
         else:
             self.engine.board = None
 
+    def setup_required(self):
+        with contextlib.closing(self.engine.connect()) as db:
+            return db.execute('SELECT COUNT(*) FROM users').fetchone()[0] == 0
+
+    def initialize_admin(self, username, password):
+        name, password = validate_account({'username': username, 'password': password})
+        with self.engine.lock, contextlib.closing(self.engine.connect()) as db, db:
+            if db.execute('SELECT COUNT(*) FROM users').fetchone()[0]:
+                raise ValueError('이미 초기 관리자 등록이 완료되었습니다. 기존 계정으로 로그인하세요.')
+            ident = db.execute('INSERT INTO users(username,password_hash,role,created_at) VALUES(?,?,?,?)',
+                               (name, hash_password(password), 'admin', utcnow())).lastrowid
+        self.audit(name, 'setup.local', ident)
+        return {'id': ident, 'username': name, 'role': 'admin'}
+
     def webhook_secret(self):
         # Created on first use; also covers a restore from a backup made before webhooks existed.
         encrypted = self.engine.settings().get('webhook_secret_encrypted')
@@ -119,7 +142,9 @@ class Runtime:
             raise HTTPException(413, '웹훅 본문이 너무 큽니다.')
         timestamp, signature = headers.get('x-qna-timestamp', ''), headers.get('x-qna-signature', '')
         event_id = headers.get('x-qna-event-id', '')
-        if not timestamp.isdigit() or not signature or not EVENT_ID.match(event_id):
+        if (not re.fullmatch(r'[0-9]{1,12}', timestamp)
+                or not re.fullmatch(r'sha256=[0-9a-f]{64}', signature)
+                or not EVENT_ID.fullmatch(event_id)):
             raise HTTPException(401, '웹훅 서명 정보가 없습니다.')
         if abs(time.time() - int(timestamp)) > WEBHOOK_TOLERANCE_SECONDS:
             raise HTTPException(401, '웹훅 시각이 허용 범위를 벗어났습니다.')
@@ -131,7 +156,7 @@ class Runtime:
             event, external_id = payload['event'], str(payload['external_id'])
         except (ValueError, KeyError, TypeError):
             raise HTTPException(400, '웹훅 본문 형식이 올바르지 않습니다.') from None
-        if event not in WEBHOOK_EVENTS or not EXTERNAL_ID.match(external_id):
+        if event not in WEBHOOK_EVENTS or not EXTERNAL_ID.fullmatch(external_id):
             raise HTTPException(400, '지원하지 않는 웹훅 이벤트입니다.')
         return event_id, external_id, self.engine.record_webhook(event_id, event, external_id)
 
@@ -275,6 +300,9 @@ class Runtime:
                 # Password and usage records must never roll back with a content restore.
                 current_users = [dict(r) for r in db.execute('SELECT * FROM users')]
                 current_usage = [dict(r) for r in db.execute('SELECT * FROM usage')]
+                current_webhooks = [dict(r) for r in db.execute('SELECT * FROM webhook_events')]
+                webhook_settings = {k: v for k, v in self.engine._settings(db).items()
+                                    if k in ('webhook_secret_encrypted', 'webhook_enabled', 'last_webhook', 'webhook_status')}
                 sequences = {r['name']: r['seq'] for r in db.execute('SELECT * FROM sqlite_sequence')}
             snapshot = self.folder / ('.restore-' + secrets.token_hex(8))
             try:
@@ -285,19 +313,23 @@ class Runtime:
                     with contextlib.closing(self.engine.connect()) as target:
                         source.backup(target)
                 with contextlib.closing(self.engine.connect()) as db, db:
+                    self.engine.migrate_webhooks(db)
                     db.execute('DELETE FROM sessions')
                     db.execute('DELETE FROM users')
                     for row in current_users:
                         db.execute('INSERT INTO users(id,username,password_hash,role,active,created_at) VALUES(?,?,?,?,?,?)', tuple(row[k] for k in ('id','username','password_hash','role','active','created_at')))
                     for row in current_usage:
                         db.execute('INSERT OR REPLACE INTO usage(id,month,kind,amount,status,input_tokens,output_tokens,created_at) VALUES(?,?,?,?,?,?,?,?)', tuple(row[k] for k in ('id','month','kind','amount','status','input_tokens','output_tokens','created_at')))
+                    for row in current_webhooks:
+                        db.execute('INSERT OR REPLACE INTO webhook_events(event_id,event,external_id,status,error,received_at,processed_at) VALUES(?,?,?,?,?,?,?)', tuple(row[k] for k in ('event_id','event','external_id','status','error','received_at','processed_at')))
                     for table, number in sequences.items():
                         existing = db.execute('SELECT seq FROM sqlite_sequence WHERE name=?', (table,)).fetchone()
                         if existing:
                             db.execute('UPDATE sqlite_sequence SET seq=MAX(seq,?) WHERE name=?', (number, table))
                         else:
                             db.execute('INSERT INTO sqlite_sequence(name,seq) VALUES(?,?)', (table, number))
-                self.internal_settings({'auto_enabled': False, 'evaluation_passed': False})
+                # Restoring content must not revive revoked webhook secrets or replay old deliveries.
+                self.internal_settings({**webhook_settings, 'auto_enabled': False, 'evaluation_passed': False})
                 # Apply privacy changes with offline indexing: a paid API outage must not undo deletion.
                 self.engine.ai = self.engine.rag.ai = None
                 self.engine.apply_tombstones(deleted)
@@ -476,10 +508,8 @@ def create_app(data_dir=None, scheduler=True):
         return user
 
     def me_data(request):
-        with contextlib.closing(engine.connect()) as db, db:
-            empty = db.execute('SELECT COUNT(*) FROM users').fetchone()[0] == 0
         user = session(request)
-        return {'setup_required': empty, 'user': {k:v for k,v in user.items() if k != 'csrf'} if user else None, 'csrf': user['csrf'] if user else None}
+        return {'setup_required': runtime.setup_required(), 'user': {k:v for k,v in user.items() if k != 'csrf'} if user else None, 'csrf': user['csrf'] if user else None}
 
     def create_session(user):
         token, csrf = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
@@ -489,27 +519,13 @@ def create_app(data_dir=None, scheduler=True):
         response.set_cookie(COOKIE, token, max_age=8*3600, httponly=True, samesite='strict', path='/')
         return response
 
-    def validate_account(data):
-        name, password = str(data.get('username', '')).strip(), str(data.get('password', ''))
-        if not 2 <= len(name) <= 40 or any(c.isspace() for c in name):
-            raise ValueError('아이디는 공백 없이 2~40자로 입력하세요.')
-        if not 10 <= len(password) <= 128:
-            raise ValueError('비밀번호는 10~128자로 입력하세요.')
-        return name, password
-
     @app.get('/api/me')
     def me(request: Request):
         return me_data(request)
 
     @app.post('/api/setup')
-    def setup(data: dict):
-        name, password = validate_account(data)
-        with engine.lock, contextlib.closing(engine.connect()) as db, db:
-            if db.execute('SELECT COUNT(*) FROM users').fetchone()[0]:
-                raise HTTPException(409, '이미 초기 설정이 완료되었습니다.')
-            ident = db.execute('INSERT INTO users(username,password_hash,role,created_at) VALUES(?,?,?,?)', (name,hash_password(password),'admin',utcnow())).lastrowid
-        runtime.audit(name,'setup',ident)
-        return create_session({'id':ident,'username':name,'role':'admin'})
+    def setup():
+        raise HTTPException(403, '웹에서는 최초 관리자 계정을 등록할 수 없습니다. 서비스 관리자에게 문의하세요.')
 
     @app.post('/api/login')
     def login(request: Request, data: dict):
@@ -658,7 +674,12 @@ def create_app(data_dir=None, scheduler=True):
     async def webhook(request: Request, tasks: BackgroundTasks):
         # Server-to-server call: no session or CSRF token. The HMAC signature,
         # timestamp window and event id replace them. Reply fast, process after.
-        body = await request.body()
+        body = bytearray()
+        async for chunk in request.stream():
+            if len(body) + len(chunk) > WEBHOOK_MAX_BYTES:
+                raise HTTPException(413, '웹훅 본문이 너무 큽니다.')
+            body.extend(chunk)
+        body = bytes(body)
         event_id, external_id, is_new = await asyncio.to_thread(runtime.receive_webhook, body, request.headers)
         if is_new:
             tasks.add_task(runtime.process_webhook, event_id, external_id)

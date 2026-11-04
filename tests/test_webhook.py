@@ -6,6 +6,7 @@ import time
 import uuid
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from app import WEBHOOK_PATH, create_app, sign_webhook
@@ -225,3 +226,94 @@ def test_secret_is_recreated_when_missing_after_restore(ready):
     row = board_only(runtime)
     assert deliver(client, runtime, row['id']).status_code == 202
     assert len(questions_for(runtime, row['id'])) == 1
+
+
+@pytest.mark.parametrize('changes', [
+    {'x-qna-signature': 'sha256=é'},
+    {'x-qna-timestamp': '²'},
+    {'x-qna-timestamp': '9' * 5000},
+    {'x-qna-event-id': 'evt-trailing-newline\n'},
+])
+def test_malformed_headers_are_rejected_without_server_errors(ready, changes):
+    _, runtime = ready
+    body = b'{"event":"question.created","external_id":"1"}'
+    timestamp = str(int(time.time()))
+    headers = {'x-qna-timestamp': timestamp, 'x-qna-event-id': 'evt-valid-header',
+               'x-qna-signature': sign_webhook(runtime.webhook_secret(), timestamp, body), **changes}
+    with pytest.raises(HTTPException) as rejected:
+        runtime.receive_webhook(body, headers)
+    assert rejected.value.status_code == 401
+    assert runtime.engine.webhook_events() == []
+
+
+def test_external_id_must_match_the_entire_value(ready):
+    client, runtime = ready
+    row = board_only(runtime)
+    assert deliver(client, runtime, str(row['id']) + '\n').status_code == 400
+    assert questions_for(runtime, row['id']) == []
+
+
+def test_oversized_streamed_body_is_rejected(ready):
+    client, runtime = ready
+    response = client.post(WEBHOOK_PATH, content=iter([b'x' * 8192] * 3))
+    assert response.status_code == 413
+    assert runtime.engine.webhook_events() == []
+
+
+@pytest.mark.parametrize('legacy', [False, True])
+def test_restore_preserves_webhook_security_and_upgrades_old_backups(ready, legacy):
+    client, runtime = ready
+    if legacy:
+        with closing(runtime.engine.connect()) as db, db:
+            db.execute('DROP TABLE webhook_events')
+            settings = runtime.engine._settings(db)
+            for name in ('webhook_secret_encrypted', 'poll_default_migrated'):
+                settings.pop(name, None)
+            settings['poll_seconds'] = 14400
+            runtime.engine._put_settings(db, settings)
+    backup = runtime.backup()['filename']
+    Engine(runtime.folder)  # simulate upgrading the live app after making the old backup
+    secret = runtime.rotate_webhook_secret('admin')
+    assert deliver(client, runtime, 1, event_id='evt-before-restore').status_code == 202
+    runtime.restore(backup, 'admin')
+    assert runtime.webhook_secret() == secret
+    assert runtime.safe_settings()['poll_seconds'] == 1800
+    assert deliver(client, runtime, 1, event_id='evt-before-restore').json()['duplicate']
+    assert deliver(client, runtime, 1, event_id='evt-after-restore').status_code == 202
+
+
+@pytest.mark.parametrize('updates', [
+    {'answer': '새 정책에 따라 담당자에게 문의해 주세요.'},
+    {'body': '변경된 서비스를 어떻게 이용하나요?'},
+    {'answer': ''},
+])
+@pytest.mark.parametrize('webhook', [True, False])
+def test_source_answer_changes_invalidate_reusable_knowledge(ready, updates, webhook):
+    client, runtime = ready
+    post(client, '/demo/prepare')
+    post(client, '/evaluate')
+    post(client, '/settings', {'auto_enabled': True})
+    title, category, _ = FAQS[0]
+    source = next(row for row in runtime.engine.demo_list() if row['title'] == title)
+    if webhook:
+        assert client.patch(f"/api/demo/{source['id']}", json=updates).status_code == 200
+    else:
+        runtime.engine.demo_update(source['id'], updates)
+        runtime.tick()
+    question = questions_for(runtime, source['id'])[0]
+    assert question['final_answer'] == updates.get('answer', source['answer'])
+    record = next(item for item in runtime.engine.list_knowledge() if item['source_key'] == f"demo:{source['id']}")
+    assert record['status'] != 'active' and not record['auto_allowed']
+    assert not runtime.engine.settings()['auto_enabled']
+    new = post(client, '/demo', {'title': title, 'body': title, 'category': category})
+    assert questions_for(runtime, new['id'])[0]['status'] == 'review'
+
+
+def test_external_answers_to_existing_questions_become_candidates(ready):
+    client, runtime = ready
+    row = post(client, '/demo', {'title': '신규 기능 위치', 'body': '메뉴는 어디에 있나요?'})
+    answer = '대시보드 메뉴에서 확인할 수 있습니다.'
+    assert client.patch(f"/api/demo/{row['id']}", json={'answer': answer}).status_code == 200
+    [record] = [item for item in runtime.engine.list_knowledge() if item['source_key'] == f"demo:{row['id']}"]
+    assert record['answer'] == answer and record['status'] == 'candidate'
+    assert not record['auto_allowed']

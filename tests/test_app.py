@@ -23,8 +23,9 @@ TEST_RULES = {
 @pytest.fixture
 def pair(tmp_path):
     app = create_app(tmp_path, scheduler=False)
+    app.state.runtime.initialize_admin('admin', 'test-password-123')
     with TestClient(app) as client:
-        response = client.post('/api/setup', json={'username':'admin','password':'test-password-123'})
+        response = client.post('/api/login', json={'username':'admin','password':'test-password-123'})
         assert response.status_code == 200
         client.headers['X-CSRF-Token'] = response.json()['csrf']
         response = client.post('/api/settings', json={'reply_rules': TEST_RULES})
@@ -134,8 +135,9 @@ def test_T06_evaluation_and_automatic_routing(pair):
 
 def test_reply_rules_are_required_and_changes_stop_automation(tmp_path):
     app=create_app(tmp_path,scheduler=False)
+    app.state.runtime.initialize_admin('admin', 'test-password-123')
     with TestClient(app) as client:
-        setup=client.post('/api/setup',json={'username':'admin','password':'test-password-123'}).json()
+        setup=client.post('/api/login',json={'username':'admin','password':'test-password-123'}).json()
         client.headers['X-CSRF-Token']=setup['csrf']
         assert client.post('/api/evaluate',json={}).status_code==400
         assert client.post('/api/settings',json={'auto_enabled':True}).status_code==400

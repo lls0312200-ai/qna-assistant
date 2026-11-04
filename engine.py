@@ -86,9 +86,6 @@ class Engine:
                     auto INTEGER NOT NULL DEFAULT 0,knowledge_candidate INTEGER NOT NULL DEFAULT 0,
                     status TEXT NOT NULL,external_answer_id TEXT,attempts INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL,updated_at TEXT NOT NULL);
-                CREATE TABLE IF NOT EXISTS webhook_events(
-                    event_id TEXT PRIMARY KEY,event TEXT NOT NULL,external_id TEXT NOT NULL,status TEXT NOT NULL,
-                    error TEXT NOT NULL DEFAULT '',received_at TEXT NOT NULL,processed_at TEXT);
                 CREATE TABLE IF NOT EXISTS deleted_items(
                     kind TEXT NOT NULL,external_id TEXT NOT NULL,deleted_at TEXT NOT NULL,
                     PRIMARY KEY(kind,external_id));
@@ -103,12 +100,8 @@ class Engine:
             if 'human_confirmed' not in question_columns:
                 db.execute('ALTER TABLE questions ADD COLUMN human_confirmed INTEGER NOT NULL DEFAULT 0')
             db.execute("INSERT OR IGNORE INTO settings VALUES(1,?)", (dumps(DEFAULTS),))
+            self.migrate_webhooks(db)
             settings = self._settings(db)
-            if not settings.get("poll_default_migrated"):
-                if int(settings.get("poll_seconds", 0)) == LEGACY_POLL_SECONDS:
-                    settings["poll_seconds"] = DEFAULTS["poll_seconds"]
-                settings["poll_default_migrated"] = True
-                self._put_settings(db, settings)
             if not settings.get("demo_seeded"):
                 timestamp = now()
                 for title, category, answer in FAQS:
@@ -119,6 +112,17 @@ class Engine:
                                (title, body, category, timestamp, timestamp))
                 settings["demo_seeded"] = True
                 self._put_settings(db, settings)
+
+    def migrate_webhooks(self, db):
+        db.execute("""CREATE TABLE IF NOT EXISTS webhook_events(
+            event_id TEXT PRIMARY KEY,event TEXT NOT NULL,external_id TEXT NOT NULL,status TEXT NOT NULL,
+            error TEXT NOT NULL DEFAULT '',received_at TEXT NOT NULL,processed_at TEXT)""")
+        settings = self._settings(db)
+        if not settings.get("poll_default_migrated"):
+            if int(settings.get("poll_seconds", 0)) == LEGACY_POLL_SECONDS:
+                settings["poll_seconds"] = DEFAULTS["poll_seconds"]
+            settings["poll_default_migrated"] = True
+            self._put_settings(db, settings)
 
     def connect(self):
         db = sqlite3.connect(self.db_path, timeout=30)
@@ -236,6 +240,12 @@ class Engine:
             item = self._question(db, question_id)
         if str(item["external_id"]).startswith("shop-") and self.board:
             item["source_url"] = self.board.url + "/?question=" + item["external_id"]
+        if item['status'] in ('posted', 'external'):
+            # A current search cannot describe which evidence a completed answer used.
+            item['matches'], item['search_error'] = [], None
+            if item['status'] == 'external':
+                item['sources'] = []
+            return item
         try:
             item["matches"] = self.search_knowledge(self._query(item))
             item["search_error"] = None
@@ -309,10 +319,16 @@ class Engine:
     def _candidate(self, db, question, answer, source_key):
         if db.execute("SELECT 1 FROM deleted_items WHERE kind='knowledge_source' AND external_id=?", (source_key,)).fetchone():
             return
-        if db.execute("SELECT 1 FROM knowledge WHERE source_key=?", (source_key,)).fetchone():
+        existing = db.execute("SELECT * FROM knowledge WHERE source_key=?", (source_key,)).fetchone()
+        text, answer = redact(self._query(question)), redact(answer)
+        if existing:
+            if (existing["question"], existing["answer"], existing["category"]) != (text, answer, question["category"]):
+                db.execute("UPDATE knowledge SET question=?,answer=?,category=?,status='candidate',auto_allowed=0,approved_by=NULL,version=version+1,updated_at=? WHERE id=?",
+                           (text, answer, question["category"], now(), existing["id"]))
+                self._invalidate(db, existing["id"])
             return
         db.execute("INSERT INTO knowledge(question,answer,category,status,valid_until,source,source_key,updated_at) VALUES(?,?,?,'candidate',?,?,?,?)",
-                   (redact(self._query(question)), redact(answer), question["category"],
+                   (text, answer, question["category"],
                     (datetime.now(timezone.utc) + timedelta(days=90)).isoformat(),
                     (self.board.url + "/?question=" + str(question["external_id"])) if str(question["external_id"]).startswith("shop-") and self.board else "demo://board/qna/" + str(question["external_id"]), source_key, now()))
 
@@ -342,18 +358,28 @@ class Engine:
                 self._candidate(db, self._question(db, question_id), board["answer"], "demo:" + external_id)
         else:
             question_id = existing["id"]
-            if board["version"] != existing["version"]:
-                db.execute("UPDATE questions SET title=?,body=?,category=?,version=?,draft='',draft_version=NULL,sources='[]',status=?,decision_reason=?,updated_at=? WHERE id=?",
+            source_changed = board["version"] != existing["version"] or (
+                existing["status"] in ("posted", "external") and
+                (board["answer"], board["answer_id"]) != (existing["final_answer"], existing["external_answer_id"]))
+            if source_changed:
+                db.execute("UPDATE questions SET title=?,body=?,category=?,version=?,draft='',draft_version=NULL,sources='[]',status=?,final_answer=?,external_answer_id=?,decision_reason=?,updated_at=? WHERE id=?",
                            (board["title"], board["body"], board["category"], board["version"],
-                            "external" if board["answer"] else "review", "문의가 수정되어 다시 검토해야 합니다.", now(), question_id))
+                            "external" if board["answer"] else "review", board["answer"], board["answer_id"],
+                            "문의 또는 답변이 수정되어 다시 검토해야 합니다.", now(), question_id))
+                for record in db.execute("SELECT id FROM knowledge WHERE source_key IN (?,?)",
+                                         ("demo:" + external_id, "reply:" + str(question_id))).fetchall():
+                    db.execute("UPDATE knowledge SET status='inactive',auto_allowed=0,approved_by=NULL,version=version+1,updated_at=? WHERE id=?",
+                               (now(), record["id"]))
+                    self._invalidate(db, record["id"])
                 outcome = "changed"
-            if board["answer"] and existing["status"] not in ("posted", "external"):
+            if board["answer"] and (source_changed or existing["status"] not in ("posted", "external")):
                 job = db.execute("SELECT * FROM outbox WHERE question_id=?", (question_id,)).fetchone()
-                if job and board["answer_key"] == job["operation_key"] and board["answer"] == job["answer"]:
+                if job and board["version"] == job["expected_version"] and board["answer_key"] == job["operation_key"] and board["answer"] == job["answer"]:
                     self._finish(db, question_id, board, job, actor)
                 else:
                     db.execute("UPDATE questions SET status='external',final_answer=?,external_answer_id=?,decision_reason=?,updated_at=? WHERE id=?",
                                (board["answer"], board["answer_id"], "다른 담당자의 답변이 확인되어 발송하지 않았습니다.", now(), question_id))
+                    self._candidate(db, self._question(db, question_id), board["answer"], "demo:" + external_id)
         return outcome
 
     def sync(self, actor="system", recovery=False):
@@ -375,6 +401,7 @@ class Engine:
                     outcome = self._ingest_row(db, board, initial, recovery, actor)
                     added += outcome == "added"
                     changed += outcome == "changed"
+                settings = self._settings(db)
                 settings["baseline_complete"] = True
                 settings["last_sync"] = now()
                 settings["connection_status"] = self._connection_label(settings)
@@ -427,6 +454,7 @@ class Engine:
             board = self._board_question(db, external_id)
             with db:
                 outcome = self._ingest_row(db, board, False, False, actor) if board else None
+                settings = self._settings(db)
                 settings["last_webhook"] = now()
                 settings["connection_status"] = self._connection_label(settings)
                 self._put_settings(db, settings)
@@ -527,7 +555,8 @@ class Engine:
 
     def _snapshot(self, matches):
         return [{"id": item["id"], "version": item["version"], "question": item["question"],
-                 "answer": item["answer"], "source": item.get("source", ""), "score": item.get("score", 0)} for item in matches]
+                 "answer": item["answer"], "source": item.get("source", ""), "score": item.get("score", 0),
+                 "category": item.get("category", "other")} for item in matches]
 
     def save_draft(self, question_id, conclusion, reason, draft, actor):
         if not str(draft).strip() or len(str(draft)) > 20000:
@@ -569,8 +598,8 @@ class Engine:
                 raise ValueError("초안의 근거가 변경·만료·삭제되었습니다. 초안을 다시 검토하고 저장해 주세요.")
 
     def _finish(self, db, question_id, board, job, actor):
-        db.execute("UPDATE questions SET status='posted',final_answer=?,external_answer_id=?,decision_reason=?,updated_at=? WHERE id=?",
-                   (board["answer"], board["answer_id"], "승인 FAQ 자동 게시 확인" if job["auto"] else "담당자 승인 게시 확인", now(), question_id))
+        db.execute("UPDATE questions SET status='posted',final_answer=?,external_answer_id=?,sources=?,decision_reason=?,updated_at=? WHERE id=?",
+                   (board["answer"], board["answer_id"], job["sources"], "승인 FAQ 자동 게시 확인" if job["auto"] else "담당자 승인 게시 확인", now(), question_id))
         db.execute("UPDATE outbox SET status='posted',external_answer_id=?,updated_at=? WHERE question_id=?", (board["answer_id"], now(), question_id))
         if job["knowledge_candidate"]:
             self._candidate(db, self._question(db, question_id), board["answer"], "reply:" + str(question_id))

@@ -112,6 +112,7 @@ def test_http_collection_webhook_and_reply_roundtrip(customer,pair):
     post(client,f"/questions/{q['id']}/draft",{'conclusion':'추가 배송비 안내','reason':'정책에 따라 안내','draft':'제주도는 추가 배송비가 있습니다.'})
     result=post(client,f"/questions/{q['id']}/post")
     assert result['status']=='posted'
+    assert runtime.engine.question(q['id'])['source_url'].endswith(new['id'])
     assert customer_client.get('/api/questions/'+new['id']).json()['answer']==result['final_answer']
     assert post(client,'/sync')['added']==0
     with closing(runtime.engine.connect()) as db:
