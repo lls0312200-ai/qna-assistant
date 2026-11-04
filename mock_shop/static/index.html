@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="MORU 모의 의류 쇼핑몰 고객센터. 배송, 교환과 반품 안내 및 상품 문의.">
+  <title>MORU · 고객센터</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <div class="demo-strip">수업용 모의 쇼핑몰입니다. 실제 주문·결제는 처리하지 않습니다.</div>
+  <header class="header">
+    <a class="brand" href="/" aria-label="MORU 고객센터 홈">MORU<span>EVERYDAY, YOUR WAY.</span></a>
+    <nav aria-label="주 메뉴"><button class="nav-link" data-view="faq">이용 안내</button><button class="nav-link selected" data-view="board">고객센터</button></nav>
+    <span class="header-note">A LITTLE HELP, WITH CARE.</span>
+  </header>
+  <main class="layout">
+    <aside class="sidebar">
+      <p class="eyebrow">CUSTOMER CARE</p><h1>고객센터</h1>
+      <div class="side-menu"><button data-view="board" class="selected">문의 게시판 <span>↗</span></button><button data-view="faq">자주 묻는 질문 <span>↗</span></button></div>
+      <div class="contact"><span class="small-label">상담 안내</span><strong>10:00 — 17:00</strong><p>평일 운영 · 점심 12:00–13:00<br>주말 및 공휴일 휴무</p><p class="subtle">게시판 문의는 언제든 남겨 주세요.<br>확인 후 차근차근 답변드릴게요.</p></div>
+    </aside>
+    <section class="content">
+      <div class="hero"><div><p class="eyebrow">WE'RE HERE FOR YOU</p><h2>무엇이 궁금하세요?</h2><p>배송부터 교환·반품까지,<br class="mobile-break"> 궁금한 점을 편하게 남겨 주세요.</p></div><div class="hero-mark" aria-hidden="true">m.</div></div>
+      <div class="tabs" role="tablist" aria-label="고객센터 메뉴"><button id="board-tab" role="tab" aria-selected="true" data-view="board">문의 게시판 <span id="board-count">—</span></button><button id="faq-tab" role="tab" aria-selected="false" data-view="faq">자주 묻는 질문 <span id="faq-count">—</span></button></div>
+      <div id="message" class="message" role="status" aria-live="polite" hidden></div>
+      <section id="board-view" aria-labelledby="board-tab">
+        <div class="section-heading"><div><h3>문의 게시판</h3><p>답변을 받으시면 문의 상세에서 확인할 수 있어요.</p></div><button class="primary" id="write-button">문의 남기기 <span aria-hidden="true">＋</span></button></div>
+        <form id="search-form" class="toolbar"><label class="search"><span aria-hidden="true">⌕</span><input id="board-search" type="search" placeholder="궁금한 내용을 검색해 보세요" aria-label="문의 검색" maxlength="200"></label><label class="filter-label">상태<select id="status-filter"><option value="">전체 문의</option><option value="waiting">답변 대기</option><option value="answered">답변 완료</option></select></label><button class="search-submit" type="submit">검색</button></form>
+        <div class="board-meta"><span id="result-count">문의 목록을 불러오고 있어요.</span><span>최신순</span></div>
+        <div class="table-wrap"><table><thead><tr><th class="number-col" scope="col">번호</th><th class="category-col" scope="col">유형</th><th scope="col">제목</th><th class="author-col" scope="col">작성자</th><th class="date-col" scope="col">작성일</th><th class="status-col" scope="col">상태</th></tr></thead><tbody id="questions-body"></tbody></table></div>
+        <div id="empty-board" class="empty" hidden>아직 등록된 문의가 없어요.</div><nav id="pagination" class="pagination" aria-label="문의 페이지"></nav>
+      </section>
+      <section id="faq-view" aria-labelledby="faq-tab" hidden>
+        <div class="section-heading"><div><h3>자주 묻는 질문</h3><p>모루의 배송·이용 정책을 한곳에서 확인하세요.</p></div></div>
+        <label class="search faq-search"><span aria-hidden="true">⌕</span><input id="faq-search" type="search" placeholder="배송비, 교환 방법 등을 검색해 보세요" aria-label="FAQ 검색"></label>
+        <div id="faq-categories" class="chips" aria-label="FAQ 유형"></div><div id="faq-list" class="faq-list"></div><div id="empty-faq" class="empty" hidden>검색 결과가 없어요. 다른 단어로 찾아보세요.</div>
+      </section>
+      <div class="bottom-note"><span class="note-mark">i</span><p>문의에 전화번호, 주소, 결제 정보 등 개인정보를 적지 마세요.<br>이 사이트의 문의는 시연을 위한 공개 테스트 자료입니다.</p></div>
+    </section>
+  </main>
+  <footer><span class="footer-brand">MORU</span><p>당신의 일상에 자연스럽게, 모루.<br>가상 의류 쇼핑몰 고객센터 · 로컬 시연용</p><a href="http://127.0.0.1:8765/" target="_blank" rel="noopener">운영자 문의데스크 ↗</a></footer>
+  <dialog id="write-dialog"><form id="write-form"><div class="dialog-head"><div><p class="eyebrow">ASK MORU</p><h2>문의 남기기</h2></div><button class="close-button" type="button" data-close="write-dialog" aria-label="문의 작성 닫기">×</button></div><p class="dialog-description">문의 내용을 자세히 남겨 주시면 확인 후 안내드릴게요.</p><div class="form-grid"><label>작성자<input name="author" value="테스트고객" required maxlength="30" autocomplete="off"></label><label>문의 유형<select name="category" id="new-category"></select></label></div><label>문의 내용<textarea name="body" rows="7" required minlength="2" maxlength="10000" placeholder="어떤 점이 궁금하신가요?"></textarea></label><p id="write-error" class="form-error" role="alert"></p><div class="dialog-actions"><button type="button" class="secondary" data-close="write-dialog">취소</button><button id="write-submit" class="primary" type="submit">문의 등록</button></div></form></dialog>
+  <dialog id="detail-dialog"><div class="dialog-head"><div><p class="eyebrow">YOUR QUESTION</p><h2>문의 상세</h2></div><button class="close-button" type="button" data-close="detail-dialog" aria-label="문의 상세 닫기">×</button></div><div id="detail-content"></div><div class="dialog-actions"><button class="secondary" id="refresh-detail" type="button">답변 새로고침</button><button class="primary" type="button" data-close="detail-dialog">확인</button></div></dialog>
+</body>
+</html>

@@ -11,6 +11,8 @@ __pycache__/
 *.dpapi
 master-key.*
 *.qbackup
+*.qkey
 *.lock
 *.log
 test-results/
+/data/
