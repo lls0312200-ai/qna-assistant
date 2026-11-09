@@ -44,6 +44,17 @@ class ShopBoard:
             raise ValueError('고객사이트 문의 목록을 확인할 수 없습니다.')
         return [self.validate(r) for r in rows]
 
+    def faqs(self):
+        rows=self.request('GET','/api/faqs')
+        if not isinstance(rows,list) or len(rows)>10000:
+            raise ValueError('고객사이트 FAQ 목록을 확인할 수 없습니다.')
+        for row in rows:
+            if not isinstance(row,dict) or not re.fullmatch(r'[A-Za-z0-9_-]{1,64}',str(row.get('id',''))):
+                raise ValueError('고객사이트 FAQ 번호를 확인해 주세요.')
+            if any(not isinstance(row.get(k),str) for k in ('question','answer','category','conditions')) or not row['question'].strip() or not row['answer'].strip() or len(row['question'])>10000 or len(row['answer'])+len(row['conditions'])>19000:
+                raise ValueError('고객사이트 FAQ 내용 형식이 올바르지 않습니다.')
+        return rows
+
     def question(self, external_id):
         if not re.fullmatch(r'shop-[1-9][0-9]*',str(external_id)):
             return None

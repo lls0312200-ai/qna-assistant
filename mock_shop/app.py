@@ -14,7 +14,7 @@ import uuid
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlencode
 
 import httpx
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request
@@ -64,6 +64,9 @@ class Shop:
                     answer TEXT NOT NULL DEFAULT '', answer_id TEXT, answer_key TEXT UNIQUE,
                     created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS metadata(name TEXT PRIMARY KEY, value TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS authorizations(id TEXT PRIMARY KEY, state TEXT NOT NULL,
+                    redirect_uri TEXT NOT NULL, expires REAL NOT NULL, status TEXT NOT NULL, code_hash TEXT UNIQUE);
+                CREATE TABLE IF NOT EXISTS access_grants(token_hash TEXT PRIMARY KEY, created_at TEXT NOT NULL);
             ''')
             if not db.execute("SELECT 1 FROM metadata WHERE name='seeded'").fetchone():
                 with (Path(source) / 'knowledge.csv').open(encoding='utf-8-sig', newline='') as f:
@@ -101,6 +104,62 @@ class Shop:
         with self.lock:
             data = {**self.credentials(), 'webhook_url': url, 'webhook_secret': secret}
             self.credentials_path.write_text(encrypt_secret(json.dumps(data), self.key), encoding='utf-8')
+
+    def authorize_request(self, data):
+        redirect = local_url(data.get('redirect_uri', ''))
+        parts = urlsplit(redirect)
+        state = data.get('state', '')
+        if parts.port != 8765 or parts.path != '/api/onboarding/callback' or not isinstance(state,str) or not re.fullmatch(r'[A-Za-z0-9_-]{32,128}',state):
+            raise ValueError('승인 요청의 반환 주소 또는 상태값이 올바르지 않습니다.')
+        ident = secrets.token_urlsafe(24)
+        with closing(self.connect()) as db, db:
+            db.execute('INSERT INTO authorizations VALUES(?,?,?,?,?,NULL)',(ident,state,redirect,time.time()+600,'pending'))
+        return ident
+
+    def authorization(self, ident):
+        with closing(self.connect()) as db:
+            row = db.execute('SELECT * FROM authorizations WHERE id=?',(ident,)).fetchone()
+        if not row or row['expires'] < time.time():
+            raise ValueError('승인 요청이 만료되었습니다. 문의데스크에서 다시 연결해 주세요.')
+        return dict(row)
+
+    def decide_authorization(self, ident, accepted):
+        with self.lock, closing(self.connect()) as db, db:
+            db.execute('BEGIN IMMEDIATE')
+            row = self.authorization(ident)
+            if row['status'] != 'pending':
+                raise ValueError('이미 처리된 승인 요청입니다.')
+            if accepted is True:
+                code=secrets.token_urlsafe(32)
+                db.execute("UPDATE authorizations SET status='approved',code_hash=? WHERE id=?",(hashlib.sha256(code.encode()).hexdigest(),ident))
+                query={'code':code,'state':row['state']}
+            else:
+                db.execute("UPDATE authorizations SET status='denied' WHERE id=?",(ident,))
+                query={'error':'access_denied','state':row['state']}
+        return row['redirect_uri']+'?'+urlencode(query)
+
+    def exchange_authorization(self, data):
+        code,state=data.get('code',''),data.get('state','')
+        if not isinstance(code,str) or len(code)>128 or not isinstance(state,str) or not re.fullmatch(r'[A-Za-z0-9_-]{32,128}',state):
+            raise ValueError('승인 코드가 올바르지 않습니다.')
+        with self.lock, closing(self.connect()) as db, db:
+            db.execute('BEGIN IMMEDIATE')
+            row=db.execute('SELECT * FROM authorizations WHERE code_hash=?',(hashlib.sha256(code.encode()).hexdigest(),)).fetchone()
+            if not row or row['status']!='approved' or row['expires']<time.time() or not hmac.compare_digest(row['state'],state):
+                raise ValueError('만료되었거나 사용한 승인 코드입니다.')
+            token=secrets.token_urlsafe(32)
+            db.execute('INSERT INTO access_grants VALUES(?,?)',(hashlib.sha256(token.encode()).hexdigest(),utcnow()))
+            db.execute("UPDATE authorizations SET status='used' WHERE id=?",(row['id'],))
+        return {'access_token':token,'permissions':['문의 조회','답글 작성','문의 알림 연결']}
+
+    @staticmethod
+    def send_signed(url, secret, payload):
+        raw=json.dumps(payload).encode()
+        stamp=str(int(time.time()))
+        digest=hmac.new(secret.encode(),stamp.encode()+b'.'+raw,hashlib.sha256).hexdigest()
+        return httpx.post(local_url(url),content=raw,timeout=5,follow_redirects=False,trust_env=False,
+                          headers={'Content-Type':'application/json','X-QnA-Timestamp':stamp,
+                                   'X-QnA-Event-Id':'shop-'+uuid.uuid4().hex,'X-QnA-Signature':'sha256='+digest}).status_code
 
     @staticmethod
     def public(row):
@@ -150,14 +209,9 @@ class Shop:
         data = self.credentials()
         if not data.get('webhook_url'):
             return
-        raw = json.dumps({'event': 'question.created', 'external_id': external_id}).encode()
-        stamp = str(int(time.time()))
-        digest = hmac.new(data['webhook_secret'].encode(), stamp.encode() + b'.' + raw, hashlib.sha256).hexdigest()
         try:
-            response = httpx.post(local_url(data['webhook_url']), content=raw, timeout=5, follow_redirects=False, trust_env=False,
-                                  headers={'Content-Type':'application/json', 'X-QnA-Timestamp':stamp,
-                                           'X-QnA-Event-Id':'shop-'+uuid.uuid4().hex, 'X-QnA-Signature':'sha256='+digest})
-            status = '수신 완료' if response.status_code == 202 else '전달 실패 · 주기 확인 대기'
+            result=self.send_signed(data['webhook_url'],data['webhook_secret'],{'event':'question.created','external_id':external_id})
+            status = '수신 완료' if result == 202 else '전달 실패 · 주기 확인 대기'
         except httpx.HTTPError:
             status = '연결 대기 · 주기 확인으로 복구'
         with closing(self.connect()) as db, db:
@@ -189,8 +243,16 @@ def create_app(folder=None, source=DATA_SOURCE):
 
     def authenticated(request: Request):
         supplied = request.headers.get('authorization','')
-        if not hmac.compare_digest(supplied, 'Bearer ' + shop.credentials()['token']):
-            raise HTTPException(401, '연결 인증이 필요합니다.')
+        if not supplied.isascii() or len(supplied)>256:
+            raise HTTPException(401,'연결 인증이 필요합니다.')
+        if hmac.compare_digest(supplied, 'Bearer ' + shop.credentials()['token']):
+            return
+        if request.url.path.startswith('/integration/authorizations') or not supplied.startswith('Bearer '):
+            raise HTTPException(401,'연결 인증이 필요합니다.')
+        with closing(shop.connect()) as db:
+            grant=db.execute('SELECT 1 FROM access_grants WHERE token_hash=?',(hashlib.sha256(supplied[7:].encode()).hexdigest(),)).fetchone()
+        if not grant:
+            raise HTTPException(401,'연결 인증이 필요합니다.')
 
     @app.get('/')
     def home():
@@ -233,7 +295,65 @@ def create_app(folder=None, source=DATA_SOURCE):
         with closing(shop.connect()) as db:
             return {'questions':db.execute('SELECT COUNT(*) FROM questions').fetchone()[0],
                     'faqs':db.execute('SELECT COUNT(*) FROM faqs').fetchone()[0],
-                    'connected':bool(shop.credentials().get('webhook_url'))}
+                    'connected':bool(shop.credentials().get('webhook_url')),'platform':'moru','site_name':'MORU'}
+
+    @app.get('/connect/authorize')
+    def approve_page(request_id: str):
+        if not re.fullmatch(r'[A-Za-z0-9_-]{32}',request_id):
+            raise ValueError('승인 요청 주소를 확인해 주세요.')
+        return FileResponse(STATIC/'authorize.html')
+
+    @app.get('/api/authorizations/{ident}')
+    def approval_info(ident: str):
+        row=shop.authorization(ident)
+        return {'client_name':'문의데스크','site_name':'MORU','status':row['status'],
+                'permissions':['게시판 문의 읽기','원본 문의에 답글 작성','새 문의 알림 연결']}
+
+    @app.post('/api/authorizations/{ident}/decision')
+    def approval_decision(ident: str, data: dict):
+        return {'redirect_url':shop.decide_authorization(ident,data.get('accepted') is True)}
+
+    @app.post('/integration/authorizations', dependencies=[Depends(authenticated)])
+    def authorization_start(data: dict):
+        return {'request_id':shop.authorize_request(data)}
+
+    @app.post('/integration/authorizations/exchange', dependencies=[Depends(authenticated)])
+    def authorization_exchange(data: dict):
+        return shop.exchange_authorization(data)
+
+    @app.get('/integration/boards', dependencies=[Depends(authenticated)])
+    def boards():
+        return [{'id':'qna','name':'MORU 문의 게시판','can_read':True,'can_reply':True}]
+
+    @app.post('/integration/connection-test', dependencies=[Depends(authenticated)])
+    def connection_test(data: dict):
+        if data.get('board_id')!='qna':
+            raise ValueError('지원하지 않는 게시판입니다.')
+        with shop.lock, closing(shop.connect()) as db:
+            db.execute('SAVEPOINT connection_probe')
+            try:
+                ident=db.execute("INSERT INTO questions(body,category,author,created_at,updated_at) VALUES('connection probe','기타','연결 시험',?,?)",(utcnow(),utcnow())).lastrowid
+                db.execute("UPDATE questions SET answer='probe reply' WHERE id=?",(ident,))
+                assert db.execute('SELECT answer FROM questions WHERE id=?',(ident,)).fetchone()[0]=='probe reply'
+            finally:
+                db.execute('ROLLBACK TO connection_probe')
+                db.execute('RELEASE connection_probe')
+        return {'can_read':True,'can_reply':True,'test_posts_kept':0}
+
+    @app.post('/integration/webhook-test', dependencies=[Depends(authenticated)])
+    def webhook_test(data: dict):
+        url=local_url(data.get('url',''))
+        parts=urlsplit(url)
+        secret,challenge=data.get('secret',''),data.get('challenge','')
+        if parts.port!=8765 or not re.fullmatch(r'/api/onboarding/webhook-test/[a-f0-9]{32}',parts.path) or not isinstance(secret,str) or not 20<=len(secret)<=128 or not isinstance(challenge,str) or not 20<=len(challenge)<=128:
+            raise ValueError('연결 시험 요청 형식이 올바르지 않습니다.')
+        try:
+            result=shop.send_signed(url,secret,{'challenge':challenge})
+        except httpx.HTTPError:
+            raise ValueError('문의데스크의 시험 알림 수신 주소에 접속할 수 없습니다.') from None
+        if result!=200:
+            raise ValueError('시험 알림 서명을 확인하지 못했습니다.')
+        return {'verified':True}
 
     @app.get('/integration/questions', dependencies=[Depends(authenticated)])
     def integration_list():

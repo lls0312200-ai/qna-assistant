@@ -16,6 +16,7 @@ def main():
     parser.add_argument('--data-dir',type=Path,default=default_data_dir())
     parser.add_argument('--no-browser',action='store_true')
     parser.add_argument('--init-admin',action='store_true',help='서버를 시작하지 않고 최초 관리자 계정을 한 번 등록합니다.')
+    parser.add_argument('--prepare-drafts',action='store_true',help='서버 시작 시 MORU 미답변의 근거 기반 검토용 초안을 준비합니다. 자동 게시하지 않습니다.')
     args=parser.parse_args()
     args.data_dir.mkdir(parents=True,exist_ok=True)
     lock=open(args.data_dir/'app.lock','a+b')
@@ -52,6 +53,8 @@ def main():
             return
         if runtime.setup_required():
             raise SystemExit('관리자 등록이 필요합니다. 서버에서 python run.py --init-admin을 먼저 실행하세요. --data-dir를 사용했다면 같은 경로를 지정하세요.')
+        if args.prepare_drafts:
+            runtime.reference_drafts.start('local-admin')
         if not args.no_browser:
             threading.Timer(1.2,lambda:webbrowser.open(f'http://127.0.0.1:{args.port}')).start()
         uvicorn.run(app,host='127.0.0.1',port=args.port,workers=1,access_log=False)

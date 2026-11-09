@@ -44,6 +44,33 @@ LEGACY_POLL_SECONDS = 14400
 WEBHOOK_EVENTS = ("question.created", "question.updated")
 
 
+def validate_reply_rules(rules):
+    if not isinstance(rules, dict):
+        raise ValueError("답변 규칙 형식이 올바르지 않습니다.")
+    fields = {"tone", "forbidden_phrases", "required_phrases", "blocked_topics", "exception_policy"}
+    if set(rules) - fields:
+        raise ValueError("지원하지 않는 답변 규칙 항목이 있습니다.")
+    normalized = {}
+    for name in ("tone", "exception_policy"):
+        value = str(rules.get(name, "")).strip()
+        if not value or len(value) > 500:
+            raise ValueError("말투와 예외 처리 기준은 1~500자로 입력하세요.")
+        normalized[name] = value
+    for name in ("forbidden_phrases", "required_phrases", "blocked_topics"):
+        values = rules.get(name, [])
+        if not isinstance(values, list) or len(values) > 50:
+            raise ValueError("규칙 목록은 항목별 최대 50개까지 입력할 수 있습니다.")
+        cleaned = []
+        for value in values:
+            value = str(value).strip()
+            if not value or len(value) > 100:
+                raise ValueError("규칙 문구는 1~100자로 입력하세요.")
+            if value not in cleaned:
+                cleaned.append(value)
+        normalized[name] = cleaned
+    return normalized
+
+
 class Engine:
     def __init__(self, data_dir: Path, ai=None):
         self.data_dir = Path(data_dir)
@@ -159,30 +186,7 @@ class Engine:
                     raise ValueError("허용 범주가 올바르지 않습니다.")
             rules_changed = False
             if "reply_rules" in data:
-                rules = data["reply_rules"]
-                if not isinstance(rules, dict):
-                    raise ValueError("답변 규칙 형식이 올바르지 않습니다.")
-                allowed_rule_fields = {"tone", "forbidden_phrases", "required_phrases", "blocked_topics", "exception_policy"}
-                if set(rules) - allowed_rule_fields:
-                    raise ValueError("지원하지 않는 답변 규칙 항목이 있습니다.")
-                normalized = {}
-                for name in ("tone", "exception_policy"):
-                    value = str(rules.get(name, "")).strip()
-                    if not value or len(value) > 500:
-                        raise ValueError("말투와 예외 처리 기준은 1~500자로 입력하세요.")
-                    normalized[name] = value
-                for name in ("forbidden_phrases", "required_phrases", "blocked_topics"):
-                    values = rules.get(name, [])
-                    if not isinstance(values, list) or len(values) > 50:
-                        raise ValueError("규칙 목록은 항목별 최대 50개까지 입력할 수 있습니다.")
-                    cleaned = []
-                    for value in values:
-                        value = str(value).strip()
-                        if not value or len(value) > 100:
-                            raise ValueError("규칙 문구는 1~100자로 입력하세요.")
-                        if value not in cleaned:
-                            cleaned.append(value)
-                    normalized[name] = cleaned
+                normalized = validate_reply_rules(data["reply_rules"])
                 rules_changed = normalized != settings.get("reply_rules")
                 data["reply_rules"] = normalized
                 if rules_changed:
@@ -245,6 +249,9 @@ class Engine:
             item['matches'], item['search_error'] = [], None
             if item['status'] == 'external':
                 item['sources'] = []
+            return item
+        if item['status']=='draft' and any(s.get('reference_draft') for s in item['sources']):
+            item['matches'],item['search_error']=item['sources'],None
             return item
         try:
             item["matches"] = self.search_knowledge(self._query(item))
@@ -566,10 +573,18 @@ class Engine:
                 question = self._question(db, question_id)
             if question["status"] in ("posted", "external", "sending", "confirm"):
                 raise ValueError("완료되었거나 발송 확인이 필요한 문의는 초안을 변경할 수 없습니다.")
-            try:
-                sources = self._snapshot(self.search_knowledge(self._query(question)))
-            except Exception:
-                sources = []
+            if question['status']=='draft' and question['draft_version']==question['version'] and any(s.get('reference_draft') for s in question['sources']):
+                with closing(self.connect()) as db:
+                    self._validate_sources(db,question['sources'])
+                sources=question['sources']
+            else:
+                try:
+                    sources = self._snapshot(self.search_knowledge(self._query(question)))
+                except Exception:
+                    sources = []
+                if any(s.get('reference_draft') for s in question['sources']):
+                    needs_decision=any(s.get('requires_decision') for s in question['sources'])
+                    sources=[dict(s,reference_draft=True,requires_decision=needs_decision) for s in sources]
             with closing(self.connect()) as db, db:
                 db.execute("UPDATE questions SET conclusion=?,reason=?,draft=?,draft_version=version,draft_revision=draft_revision+1,sources=?,status='draft',decision_reason=?,updated_at=? WHERE id=?",
                            (str(conclusion).strip(), str(reason).strip(), str(draft).strip(), dumps(sources), "담당자 최종 승인 대기", now(), question_id))
@@ -614,6 +629,8 @@ class Engine:
                 raise ValueError("기존 발송 결과를 먼저 확인해 주세요. 자동 재전송하지 않습니다.")
             if question["status"] == "external":
                 raise ValueError("게시판에 이미 답변이 있습니다.")
+            if any(s.get('requires_decision') for s in question['sources']) and not (question['conclusion'].strip() and question['reason'].strip()):
+                raise ValueError('개별 판단이 필요한 자동 초안입니다. 담당자의 결론과 이유를 입력하고 저장한 뒤 게시해 주세요.')
             settings = self._settings(db)
             self._check_connection(settings)
             board = self._board_question(db, question["external_id"])

@@ -89,6 +89,8 @@ class Runtime:
         self.webhook_secret()
         self.configure_ai()
         self.configure_board()
+        from suggestions import ReferenceDrafts
+        self.reference_drafts=ReferenceDrafts(self)
 
     def configure_board(self):
         settings = self.engine.settings()
@@ -507,6 +509,9 @@ def create_app(data_dir=None, scheduler=True):
             raise HTTPException(403, '관리자만 사용할 수 있습니다.')
         return user
 
+    from onboarding import register_connection_routes
+    register_connection_routes(app, runtime, admin)
+
     def me_data(request):
         user = session(request)
         return {'setup_required': runtime.setup_required(), 'user': {k:v for k,v in user.items() if k != 'csrf'} if user else None, 'csrf': user['csrf'] if user else None}
@@ -560,6 +565,14 @@ def create_app(data_dir=None, scheduler=True):
     @app.get('/api/questions')
     def questions(status:str='',search:str='',user=Depends(authorized)):
         return engine.list_questions(status,search[:200])
+
+    @app.get('/api/reference-drafts')
+    def reference_drafts(user=Depends(authorized)):
+        return runtime.reference_drafts.status()
+
+    @app.post('/api/reference-drafts')
+    def prepare_reference_drafts(user=Depends(admin)):
+        return runtime.reference_drafts.start(user['username'])
 
     @app.get('/api/questions/{ident}')
     def question(ident:int,user=Depends(authorized)):
