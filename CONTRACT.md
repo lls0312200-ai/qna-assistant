@@ -29,4 +29,8 @@ GET /api/demo; POST /api/demo {title,body,category}; PATCH /api/demo/{id} {body?
 
 ## UI
 
+Review-only MORU drafts: `GET /api/reference-drafts` (authenticated) returns availability, API configuration, pending count and job progress. `POST /api/reference-drafts` (admin + CSRF) starts one process-local worker and returns immediately; repeated starts while running return the existing job. It imports published FAQ question/answer/conditions as active manual-draft evidence with `auto_allowed=0`, skips inactive/deleted knowledge and all existing operator input, then calls `AIClient.suggest`. That method returns validated JSON `{draft,source_ids,needs_operator_decision,review_notes}` and uses only supplied source IDs; uncited text is discarded and held for review. Provider errors stop the run without removing saved drafts. No posting or email API is invoked.
+
+Suggested source snapshots include `reference_draft=true` and `requires_decision`. Selected evidence is preserved when saving a draft; a required operator decision blocks posting until conclusion/reason are saved. Current harness checks and explicit human publication remain in force. The UI shows job progress without rerendering the answer form. `run.py --prepare-drafts` starts this worker on local launch; the default launcher does not automatically generate drafts for incoming webhooks.
+
 static/index.html, app.js, style.css. Korean, navy/white, clear demo/real status, setup/login, sidebar dashboard/questions/knowledge/settings/audit/demo. App API envelopes lists directly; dashboard/questions detail above. Render user text using textContent not innerHTML. Button state, error toast, keyboard labels, mobile layout, 15s dashboard refresh (do not overwrite input edits). No external assets/CDN.
