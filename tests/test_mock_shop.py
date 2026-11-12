@@ -10,7 +10,7 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from mock_shop.app import create_app, local_url
+from mock_shop.app import BUNDLED_DATA, create_app, local_url
 from shop_connector import ShopBoard
 from test_app import pair, post  # noqa: F401
 from test_webhook import deliver
@@ -49,6 +49,16 @@ def test_seed_once_preserves_source_and_hides_labels(customer):
     assert 'auto_ok' not in client.get('/api/faqs').json()[0]
     assert create_app(shop.folder,source).state.shop.question('shop-1')['body']==row['body']
     assert client.get('/api/status').json()['questions']==1
+
+
+def test_bundled_data_seeds_faqs_and_unanswered_demo_questions(tmp_path):
+    with TestClient(create_app(tmp_path, BUNDLED_DATA)) as client:
+        status = client.get('/api/status').json()
+        assert (status['faqs'], status['questions']) == (52, 113)
+        questions = client.get('/api/questions', params={'status': 'waiting'}).json()
+        assert questions['total'] == 113
+        assert client.get('/api/questions/shop-1').json()['category'] == '배송'
+        assert client.get('/api/questions/shop-113').json()['category'] == '기타'
 
 
 def test_customer_input_auth_and_origin(customer):

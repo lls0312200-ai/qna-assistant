@@ -15,4 +15,7 @@ master-key.*
 *.lock
 *.log
 test-results/
-/data/
+/data/*
+!/data/README.md
+!/data/knowledge.csv
+!/data/demo_questions.csv

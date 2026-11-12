@@ -1,6 +1,6 @@
 # 문의 데스크 · Q&A Assistant
 
-독립된 의류 쇼핑몰 고객사이트는 [MORU 실행 안내](MOCK_SHOP.md)를 참고하세요. FAQ 52건·문의 113건을 별도 DB에 넣고, 문의데스크와 HTTP API·서명 웹훅으로 연결합니다.
+독립된 의류 쇼핑몰 고객사이트는 [MORU 실행 안내](MOCK_SHOP.md)를 참고하세요. 저장소에 포함된 FAQ 52건과 시연용 가상 문의 113건을 첫 실행에 적재합니다. 문의데스크와는 HTTP API·서명 웹훅으로 연결합니다. [데이터 구성 및 출처](data/README.md)
 
 관리자 메뉴 **사이트 연동**에서 **플랫폼 선택 → 사이트 주소 입력 → 공식 연동 승인 → 게시판 선택 → 하네스 설정 → 연결 시험** 순서로 연결합니다. 현재는 로컬 MORU의 모의 승인만 지원하며, 실제 플랫폼 연동은 준비 중입니다. 마지막 시험이 통과해야 연결과 하네스가 활성 설정에 적용됩니다.
 
@@ -138,7 +138,7 @@ node --check static/app.js
 
 ## GitHub와 실제 사이트 연결
 
-팀 저장소는 https://github.com/lls0312200-ai/qna-assistant 이며 비공개입니다. 팀원 작업은 `dev`에서 분기하고 `dev`로 통합합니다. `master` 반영은 프로젝트 소유자가 별도로 검토합니다. 새 저장소를 만들지 말고 기존 저장소를 복제하세요.
+팀원 작업은 `dev`에서 분기하고 `dev`로 통합합니다. `master` 반영은 프로젝트 소유자가 별도로 검토합니다. [SP2 발표자료와 대본](docs/presentations/)
 
 ```powershell
 git clone https://github.com/lls0312200-ai/qna-assistant.git
