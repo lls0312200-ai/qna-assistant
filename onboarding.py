@@ -228,6 +228,7 @@ class ConnectionWizard:
                         'main_url':data['site_url'],'qna_url':data['site_url'],
                         'shop_token_encrypted':encrypt_secret(data['access_token'],self.runtime.key),
                         'reply_rules':rules,'auto_enabled':False,'evaluation_passed':False,'evaluation':None,'webhook_enabled':True,
+                        'allowed_categories': [] if initial else current['allowed_categories'],
                         'baseline_complete':True,'last_sync':now(),'connection_status':'정상 · MORU 고객사이트'})
                     engine.board=board
                     for row in rows:

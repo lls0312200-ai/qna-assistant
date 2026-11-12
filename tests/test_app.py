@@ -2,6 +2,7 @@
 from contextlib import closing
 from concurrent.futures import ThreadPoolExecutor
 import json
+from threading import Event
 import time
 from unittest.mock import Mock
 
@@ -240,7 +241,22 @@ def test_mail_retry_and_uncertain_delivery_without_network(pair,monkeypatch):
     post(client,'/sync');new_question(client)
     post(client,'/settings',{'smtp_host':'smtp.example','smtp_to':'owner@example.com','smtp_from':'bot@example.com'})
     fake=Mock();monkeypatch.setattr(runtime,'mail_connection',lambda settings:fake)
-    runtime.process_notifications()
+    sending, release = Event(), Event()
+
+    def block_until_second_worker(message):
+        sending.set()
+        assert release.wait(5)
+
+    fake.send_message.side_effect = block_until_second_worker
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(runtime.process_notifications)
+        try:
+            assert sending.wait(5)
+            pool.submit(runtime.process_notifications).result(3)
+        finally:
+            release.set()
+        first.result(5)
+    assert fake.send_message.call_count == 1
     assert client.get('/api/notifications').json()[0]['status']=='sent'
     msg=fake.send_message.call_args.args[0]
     assert '대시보드 사용' not in msg.get_content()
