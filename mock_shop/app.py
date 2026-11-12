@@ -25,7 +25,9 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from security import decrypt_secret, encrypt_secret, load_master_key
 
 STATIC = Path(__file__).parent / 'static'
-DATA_SOURCE = Path(__file__).resolve().parents[2] / 'data'
+BUNDLED_DATA = Path(__file__).resolve().parents[1] / 'data'
+LOCAL_DATA = BUNDLED_DATA.parent.parent / 'data'
+DATA_SOURCE = LOCAL_DATA if all((LOCAL_DATA / name).is_file() for name in ('knowledge.csv', 'evaluation.csv')) else BUNDLED_DATA
 CATEGORIES = ('배송', '교환반품', '사이즈', '상품', '환불', '결제', '적립금', '회원', '기타')
 
 
@@ -71,7 +73,10 @@ class Shop:
             if not db.execute("SELECT 1 FROM metadata WHERE name='seeded'").fetchone():
                 with (Path(source) / 'knowledge.csv').open(encoding='utf-8-sig', newline='') as f:
                     knowledge = list(csv.DictReader(f))
-                with (Path(source) / 'evaluation.csv').open(encoding='utf-8-sig', newline='') as f:
+                inquiries_path = Path(source) / 'demo_questions.csv'
+                if not inquiries_path.is_file():
+                    inquiries_path = Path(source) / 'evaluation.csv'
+                with inquiries_path.open(encoding='utf-8-sig', newline='') as f:
                     inquiries = list(csv.DictReader(f))
                 lookup = {r['id']: r for r in knowledge}
                 if len(lookup) != len(knowledge) or any(not r['question'].strip() or not r['answer'].strip() for r in knowledge):
@@ -79,7 +84,7 @@ class Shop:
                 for r in knowledge:
                     db.execute('INSERT INTO faqs VALUES(?,?,?,?,?,?,?,?)', tuple(r[k] for k in ('id','question','answer','category','conditions','auto_ok','source_url','note')))
                 for i, r in enumerate(inquiries):
-                    category = lookup.get(r['expected_knowledge_id'], {}).get('category')
+                    category = r.get('category') or lookup.get(r.get('expected_knowledge_id'), {}).get('category')
                     if not category:
                         intent = r.get('source_intent', '')
                         category = '배송' if intent.startswith('배송') else '교환반품' if '교환' in intent or '취소' in intent or '변경' in intent else '상품' if '제품' in intent else '기타'
