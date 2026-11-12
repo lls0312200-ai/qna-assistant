@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from demo_data import EVALUATION, FAQS, PAST_UNANSWERED
+from moru_evaluation import SHOP_AUTO_CATEGORIES, read_cases, score_cases
 from rag import RAG, blocked_reason, redact, reply_rule_violation, reply_rules_ready, should_auto
 from security import load_master_key
 
@@ -34,6 +35,7 @@ DEFAULTS = {
     "connection_status": "미연결 · 모의 게시판", "evaluation_passed": False,
     "budget_krw": 30000, "smtp_host": "", "smtp_port": 587,
     "smtp_user": "", "smtp_from": "", "smtp_to": "", "smtp_tls": True,
+    "smtp_app_url": "http://127.0.0.1:8765",
     "baseline_complete": False, "demo_seeded": False, "evaluation": None,
     "demo_faults": {"offline": False, "auth": False, "timeout_after_post": False, "webhook_drop": False},
 }
@@ -42,6 +44,7 @@ DEFAULTS = {
 # and polling is only a fallback for sites without webhooks or for missed deliveries.
 LEGACY_POLL_SECONDS = 14400
 WEBHOOK_EVENTS = ("question.created", "question.updated")
+DEMO_AUTO_CATEGORIES = ("usage", "hours", "policy")
 
 
 def validate_reply_rules(rules):
@@ -78,6 +81,7 @@ class Engine:
         self.db_path = self.data_dir / "qna.sqlite3"
         # ponytail: one local process; use a worker queue if deployment grows.
         self.lock = threading.RLock()
+        self.evaluation_lock = threading.Lock()
         self.ai = ai
         self.board = None
         self.rag = RAG(self.data_dir, load_master_key(self.data_dir), ai=ai)
@@ -175,15 +179,27 @@ class Engine:
     def update_settings(self, data, actor):
         with self.lock, closing(self.connect()) as db, db:
             settings = self._settings(db)
-            if data.get("mode", settings.get("mode", "demo")) not in ("demo", "shop"):
+            mode = data.get("mode", settings["mode"])
+            if mode not in ("demo", "shop"):
                 raise ValueError("지원하지 않는 연결 방식입니다.")
             if "poll_seconds" in data and not 300 <= int(data["poll_seconds"]) <= 86400:
                 raise ValueError("수집 주기는 300~86,400초여야 합니다.")
             if "webhook_enabled" in data and not isinstance(data["webhook_enabled"], bool):
                 raise ValueError("웹훅 사용 여부 형식이 올바르지 않습니다.")
+            if "auto_enabled" in data and not isinstance(data["auto_enabled"], bool):
+                raise ValueError("자동 답변 사용 여부를 확인해 주세요.")
+            categories = SHOP_AUTO_CATEGORIES if mode == "shop" else DEMO_AUTO_CATEGORIES
             if "allowed_categories" in data:
-                if not isinstance(data["allowed_categories"], list) or not set(data["allowed_categories"]).issubset({"usage", "hours", "policy"}):
+                if not isinstance(data["allowed_categories"], list) or any(value not in categories for value in data["allowed_categories"]):
                     raise ValueError("허용 범주가 올바르지 않습니다.")
+                data["allowed_categories"] = [name for name in categories if name in data["allowed_categories"]]
+            if mode != settings["mode"]:
+                data.setdefault("allowed_categories", [] if mode == "shop" else list(DEMO_AUTO_CATEGORIES))
+                data.update(auto_enabled=False, evaluation_passed=False, evaluation=None)
+            if mode == "shop" and "allowed_categories" in data and set(data["allowed_categories"]) != set(settings["allowed_categories"]):
+                if data.get("auto_enabled"):
+                    raise ValueError("허용 범주를 저장하고 다시 평가한 후 자동 답변을 켜세요.")
+                data.update(auto_enabled=False, evaluation_passed=False)
             rules_changed = False
             if "reply_rules" in data:
                 normalized = validate_reply_rules(data["reply_rules"])
@@ -195,11 +211,14 @@ class Engine:
                     data["auto_enabled"] = False
             prospective = {**settings, **data}
             if data.get("auto_enabled"):
-                if prospective.get("mode") == "shop":
-                    raise ValueError("쇼핑몰 데이터의 의미·조건 기반 자동 답변은 별도 검증 후 활성화할 수 있습니다.")
                 if not reply_rules_ready(prospective):
                     raise ValueError("답변 규칙을 저장한 후 자동 모드를 켤 수 있습니다.")
-                if not prospective.get("evaluation_passed"):
+                if mode == "shop":
+                    if not self._shop_evaluation_current(db, prospective):
+                        raise ValueError("현재 MORU 범주와 지식으로 평가를 통과한 후 자동 답변을 켜세요.")
+                    if not settings["auto_enabled"]:
+                        data["shop_auto_after_id"] = db.execute("SELECT COALESCE(MAX(id),0) FROM questions").fetchone()[0]
+                elif not prospective.get("evaluation_passed"):
                     raise ValueError("모의 품질 평가를 통과한 후 자동 모드를 켤 수 있습니다.")
                 if not self._active_knowledge(db):
                     raise ValueError("승인된 활성 지식이 필요합니다.")
@@ -271,8 +290,10 @@ class Engine:
             counts = {"review": 0, "draft": 0, "posted": 0, "confirm": 0}
             counts.update({row[0]: row[1] for row in db.execute("SELECT status,COUNT(*) FROM questions GROUP BY status")})
             settings = self._settings(db)
+            evaluated = self._shop_evaluation_current(db, settings) if settings["mode"] == "shop" else settings["evaluation_passed"]
             return {"counts": counts, "connection_status": settings["connection_status"],
-                    "last_sync": settings["last_sync"], "auto_enabled": settings["auto_enabled"],
+                    "last_sync": settings["last_sync"], "auto_enabled": settings["auto_enabled"] and evaluated,
+                    "evaluation_passed": evaluated,
                     "webhook_enabled": settings.get("webhook_enabled", True),
                     "last_webhook": settings.get("last_webhook"), "webhook_status": settings.get("webhook_status"),
                     "poll_seconds": settings.get("poll_seconds"),
@@ -620,7 +641,7 @@ class Engine:
             self._candidate(db, self._question(db, question_id), board["answer"], "reply:" + str(question_id))
         self._audit(db, actor, "answer.confirmed", question_id, {"external_answer_id": board["answer_id"], "auto": bool(job["auto"])})
 
-    def post_answer(self, question_id, actor, auto=False, knowledge_candidate=False):
+    def post_answer(self, question_id, actor, auto=False, knowledge_candidate=False, shop_match=None):
         with self.lock, closing(self.connect()) as db:
             question = self._question(db, question_id)
             if question["status"] == "posted":
@@ -629,8 +650,12 @@ class Engine:
                 raise ValueError("기존 발송 결과를 먼저 확인해 주세요. 자동 재전송하지 않습니다.")
             if question["status"] == "external":
                 raise ValueError("게시판에 이미 답변이 있습니다.")
-            if any(s.get('requires_decision') for s in question['sources']) and not (question['conclusion'].strip() and question['reason'].strip()):
-                raise ValueError('개별 판단이 필요한 자동 초안입니다. 담당자의 결론과 이유를 입력하고 저장한 뒤 게시해 주세요.')
+            held_by_automation = (not auto and str(question["external_id"]).startswith("shop-")
+                                  and question["rule_check"] not in ("", "통과"))
+            if (held_by_automation or any(s.get('requires_decision') for s in question['sources'])) and not (
+                question['conclusion'].strip() and question['reason'].strip()
+            ):
+                raise ValueError('담당자 판단이 필요한 문의입니다. 결론과 이유를 입력하고 저장한 뒤 게시해 주세요.')
             settings = self._settings(db)
             self._check_connection(settings)
             board = self._board_question(db, question["external_id"])
@@ -659,9 +684,18 @@ class Engine:
             if auto:
                 if question["baseline"] or question["recovery"]:
                     raise ValueError("과거·복구 문의는 자동 답변 대상이 아닙니다.")
-                allowed, reason, match = should_auto(question, self.search_knowledge(self._query(question)), settings)
-                if not allowed or not match or question["draft"] != match["answer"]:
-                    raise ValueError("자동 게시 직전 조건을 충족하지 않습니다: " + reason)
+                if str(question["external_id"]).startswith("shop-"):
+                    if (not settings["auto_enabled"] or not self._shop_evaluation_current(db, settings)
+                            or question_id <= settings.get("shop_auto_after_id", 0)
+                            or not shop_match or question["sources"] != self._snapshot([shop_match])
+                            or question["draft"] != shop_match["answer"]):
+                        raise ValueError("MORU 자동 게시의 현재 평가 또는 승인 근거를 확인할 수 없습니다.")
+                else:
+                    if settings["mode"] != "demo":
+                        raise ValueError("현재 연결된 게시판의 문의만 자동 처리할 수 있습니다.")
+                    allowed, reason, match = should_auto(question, self.search_knowledge(self._query(question)), settings)
+                    if not allowed or not match or question["draft"] != match["answer"]:
+                        raise ValueError("자동 게시 직전 조건을 충족하지 않습니다: " + reason)
             operation_key = hashlib.sha256(f"demo:{question_id}:{question['version']}".encode()).hexdigest()
             with db:
                 db.execute("INSERT INTO outbox(question_id,operation_key,expected_version,answer,sources,auto,knowledge_candidate,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,'sending',?,?) ON CONFLICT(question_id) DO UPDATE SET operation_key=excluded.operation_key,expected_version=excluded.expected_version,answer=excluded.answer,sources=excluded.sources,auto=excluded.auto,knowledge_candidate=excluded.knowledge_candidate,status='sending',updated_at=excluded.updated_at",
@@ -727,10 +761,79 @@ class Engine:
             self._audit(db, actor, "answer.reconcile", question_id)
             return self._question(db, question_id)
 
+    def _shop_evaluation_stamp(self, settings, records):
+        basis = {
+            "policy_version": 1,
+            "shop_url": settings.get("shop_url"),
+            "board": settings.get("shop_board_id"),
+            "categories": sorted(settings["allowed_categories"]),
+            "rules": settings["reply_rules"],
+            "rules_version": settings["rules_version"],
+            "model": getattr(self.ai, "model", None),
+            "embedding_model": getattr(self.ai, "embedding_model", None),
+            "knowledge": [(r["id"], r["version"], r["auto_allowed"], r["valid_until"]) for r in records],
+        }
+        return hashlib.sha256(dumps(basis).encode("utf-8")).hexdigest()
+
+    def _shop_evaluation_current(self, db, settings):
+        result = settings.get("evaluation") or {}
+        return bool(settings["mode"] == "shop" and self.board and self.ai
+                    and settings["evaluation_passed"] and result.get("passed") and result.get("scope") == "moru"
+                    and result.get("stamp") == self._shop_evaluation_stamp(settings, self._active_knowledge(db)))
+
+    def shop_evaluation_current(self):
+        with self.lock, closing(self.connect()) as db:
+            return self._shop_evaluation_current(db, self._settings(db))
+
+    def _auto_decision(self, question, settings, ai=None):
+        query = self._query(question)
+        searchable = (settings["auto_enabled"] and settings["evaluation_passed"]
+                      and question["category"] in settings["allowed_categories"] and not blocked_reason(query))
+        matches = self.search_knowledge(query) if searchable else []
+        return should_auto(question, matches, settings, judge=ai.same_policy if ai else None)
+
+    def evaluate_shop(self, content, actor):
+        if not self.evaluation_lock.acquire(blocking=False):
+            raise ValueError("MORU 평가가 이미 진행 중입니다.")
+        try:
+            with self.lock, closing(self.connect()) as db, db:
+                settings = self._settings(db)
+                if settings["mode"] != "shop" or not self.board or not self.ai:
+                    raise ValueError("MORU를 연결하고 OpenAI API 키를 설정해 주세요.")
+                if not reply_rules_ready(settings):
+                    raise ValueError("답변 규칙을 저장한 후 평가를 실행하세요.")
+                categories = [name for name in SHOP_AUTO_CATEGORIES if name in settings["allowed_categories"]]
+                if not categories:
+                    raise ValueError("평가할 자동 답변 범주를 먼저 저장하세요.")
+                records = self._active_knowledge(db)
+                cases = read_cases(content, records, categories)
+                stamp = self._shop_evaluation_stamp(settings, records)
+                ai = self.ai
+                settings.update(auto_enabled=False, evaluation_passed=False, evaluation=None)
+                self._put_settings(db, settings)
+            checks = {**settings, "auto_enabled": True, "evaluation_passed": True}
+            result = score_cases(cases, categories, lambda question: self._auto_decision(question, checks, ai))
+            result.update(scope="moru", stamp=stamp, evaluated_at=now())
+            with self.lock, closing(self.connect()) as db, db:
+                current = self._settings(db)
+                if (current["mode"] != "shop" or self.ai is not ai
+                        or stamp != self._shop_evaluation_stamp(current, self._active_knowledge(db))):
+                    raise ValueError("평가 중 연결·규칙·지식·AI 설정이 바뀌었습니다. 다시 평가하세요.")
+                current.update(auto_enabled=False, evaluation_passed=result["passed"], evaluation=result)
+                self._put_settings(db, current)
+                self._audit(db, actor, "evaluation.moru_complete", detail={
+                    "passed": result["passed"], "total": result["total"], "wrong_auto": result["wrong_auto"],
+                })
+            return result
+        finally:
+            self.evaluation_lock.release()
+
     def evaluate(self, actor):
         with self.lock:
             records = self._records()
             settings = {**self.settings(), "auto_enabled": True, "evaluation_passed": True}
+            if settings["mode"] != "demo":
+                raise ValueError("MORU 연결에서는 별도 평가 CSV를 사용하세요.")
             if not reply_rules_ready(settings):
                 raise ValueError("답변 규칙을 저장한 후 자동 답변 평가를 실행하세요.")
             automatic = correct = blocked_sent = 0
@@ -771,31 +874,47 @@ class Engine:
             settings = self.settings()
             if not dry_run and not settings.get("auto_enabled"):
                 return {"dry_run": False, "posted": 0, "results": [], "reason": "자동 모드가 꺼져 있습니다."}
+            shop_mode = settings["mode"] == "shop"
+            if shop_mode:
+                with closing(self.connect()) as db, db:
+                    if not self._shop_evaluation_current(db, settings):
+                        if not dry_run:
+                            settings.update(auto_enabled=False, evaluation_passed=False)
+                            self._put_settings(db, settings)
+                        return {"dry_run": dry_run, "posted": 0, "results": [], "reason": "현재 조건으로 MORU 평가를 다시 실행하세요."}
             for question in self.list_questions(status="review"):
-                if question["baseline"] or question["recovery"]:
+                if question["baseline"] or question["recovery"] or str(question["external_id"]).startswith("shop-") != shop_mode:
+                    continue
+                if shop_mode and (any(question[key] for key in ("draft", "conclusion", "reason"))
+                                  or (not dry_run and (question["id"] <= settings.get("shop_auto_after_id", 0) or question["rule_check"]))):
                     continue
                 try:
                     checks = {**self.settings(), "auto_enabled": True} if dry_run else self.settings()
-                    matches = self.search_knowledge(self._query(question))
-                    allowed, reason, match = should_auto(question, matches, checks)
-                    with closing(self.connect()) as db, db:
-                        db.execute("UPDATE questions SET decision_reason=?,rule_version=?,rule_check=?,human_confirmed=0,updated_at=? WHERE id=?",
-                                   (reason, int(checks.get("rules_version", 0)), "통과" if allowed else reason, now(), question["id"]))
-                    if allowed and not dry_run:
+                    allowed, reason, match = self._auto_decision(question, checks, self.ai if shop_mode else None)
+                    if not dry_run:
                         with closing(self.connect()) as db, db:
-                            db.execute("UPDATE questions SET draft=?,draft_version=version,sources=?,status='draft' WHERE id=?", (match["answer"], dumps(self._snapshot([match])), question["id"]))
-                        posted = self.post_answer(question["id"], actor, auto=True)
+                            db.execute("UPDATE questions SET decision_reason=?,rule_version=?,rule_check=?,human_confirmed=0,updated_at=? WHERE id=?",
+                                       (reason, int(checks.get("rules_version", 0)), "통과" if allowed else reason, now(), question["id"]))
+                            if allowed:
+                                db.execute("UPDATE questions SET draft=?,draft_version=version,draft_revision=draft_revision+1,sources=?,status='draft' WHERE id=?",
+                                           (match["answer"], dumps(self._snapshot([match])), question["id"]))
+                                self._audit(db, actor, "automatic.decision", question["id"], {
+                                    "reason": reason, "source_id": match["id"], "rules_version": checks["rules_version"],
+                                })
+                    if allowed and not dry_run:
+                        posted = self.post_answer(question["id"], actor, auto=True, shop_match=match if shop_mode else None)
                         status = posted["status"]
                     else:
                         status = "eligible" if allowed else "review"
                     results.append({"id": question["id"], "eligible": allowed, "status": status, "reason": reason})
                 except Exception as exc:
                     reason = str(exc) if isinstance(exc, ValueError) else "검색 또는 자동 처리 오류 · 수동 검토가 필요합니다."
-                    with closing(self.connect()) as db, db:
-                        current = self._settings(db)
-                        db.execute("UPDATE questions SET decision_reason=?,rule_version=?,rule_check=?,human_confirmed=0,updated_at=? WHERE id=?",
-                                   (reason, int(current.get("rules_version", 0)), reason, now(), question["id"]))
-                        self._audit(db, actor, "automatic.failed", question["id"], {"error_type": type(exc).__name__})
+                    if not dry_run:
+                        with closing(self.connect()) as db, db:
+                            current = self._settings(db)
+                            db.execute("UPDATE questions SET decision_reason=?,rule_version=?,rule_check=?,human_confirmed=0,updated_at=? WHERE id=?",
+                                       (reason, int(current.get("rules_version", 0)), reason, now(), question["id"]))
+                            self._audit(db, actor, "automatic.failed", question["id"], {"error_type": type(exc).__name__})
                     results.append({"id": question["id"], "eligible": False, "status": "review", "reason": reason})
             with closing(self.connect()) as db, db:
                 self._audit(db, actor, "automatic.run", detail={"dry_run": dry_run, "count": len(results)})

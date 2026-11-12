@@ -69,11 +69,11 @@ async function renderDashboard(root) { const data = await api('/dashboard'); if 
   const stats = el('div', 'stats'); for (const [key, name, caption, image, tone] of [['review', '검토 대기', '담당자의 확인이 필요한 문의', 'inbox', 'orange'], ['draft', '답변 초안', '검토 후 게시할 수 있는 답변', 'file', ''], ['posted', '답변 완료', '게시가 확인된 문의', 'check', 'green'], ['confirm', '게시 확인 필요', '중복 게시 전 확인이 필요한 문의', 'clock', 'orange']]) { const card = link('', `questions?status=${key}`, `stat ${tone}`); append(card, append(el('div', 'stat-label'), el('span', '', name), append(el('span', 'stat-icon'), icon(image, 18))), append(el('div', 'stat-value', counts[key] || 0), el('small', '', '건')), el('div', 'stat-caption', caption)); stats.append(card); } root.append(stats);
   const grid = el('div', 'dashboard-grid'); const recent = panel('최근 접수 문의', '처리 현황과 확인이 필요한 문의를 살펴보세요.', link('전체 보기 →', 'questions')); const questions = data.recent || data.questions || []; if (!questions.length) recent.append(empty('접수된 문의가 없습니다', '모의 Q&A에서 문의를 추가하고 게시판을 수집하세요.')); else questions.slice(0, 7).forEach((q, index) => { const row = link('', `questions/${q.id}`, 'question-row'); append(row, el('span', 'question-index', String(index + 1).padStart(2, '0')), append(el('div', 'question-row-main'), append(el('div'), badge(q.status), el('span', 'category-label', category(q.category))), el('h3', '', q.title), append(el('p'), el('span', '', `#${q.external_id || q.id}`), el('span', '', date(q.created_at, true)))), append(el('span', 'button subtle small'), document.createTextNode('확인'), icon('arrow', 13))); recent.append(row); });
   const right = el('div', 'stack'); const operation = panel('운영 상태', '모의 사이트 기준'); const operationBody = el('div', 'panel-body'); append(operationBody, statusLine('게시판 연결', connectionNames[data.connection_status] || data.connection_status || '미확인', ['connected', 'ok', 'demo'].includes(data.connection_status) ? 'good' : ''), statusLine('답변 규칙', data.rules_version ? `버전 ${data.rules_version}` : '설정 필요', data.rules_version ? 'good' : 'warn'), statusLine('자동 답변', data.auto_enabled ? '활성화' : '검토 후 수동 게시', data.auto_enabled ? 'good' : ''), statusLine('웹훅 수신', data.webhook_enabled === false ? '꺼짐 · 주기 확인만 사용' : data.last_webhook ? `${date(data.last_webhook, true)} · ${data.webhook_status || '정상'}` : '대기 중', data.webhook_enabled === false ? '' : (data.webhook_status || '').includes('실패') ? 'warn' : 'good'), statusLine('주기 확인', `${Math.round((data.poll_seconds || 1800) / 60)}분마다 · 최근 ${date(data.last_sync, true)}`), data.next_poll ? statusLine('다음 확인', date(data.next_poll, true)) : null, statusLine('승인된 지식', `${data.knowledge_active || 0}개`), el('hr', 'divider'), el('p', 'mini-note', '기존 문의는 자동 답변에서 제외하며, 근거와 현재 규칙을 통과한 신규 문의만 자동 처리합니다.')); operation.append(operationBody); right.append(operation);
-  const evaluation = panel('검증 상태', '자동 답변을 켜기 전 확인'); const evaluationBody = el('div', 'panel-body'); const ev = data.evaluation; const passed = ev?.passed ?? data.evaluation_passed; append(evaluationBody, badge(passed ? 'active' : 'review', passed ? '내장 평가 통과' : '평가 확인 필요'), el('p', 'mini-note', '내장 합성 문의로 동작을 검사합니다. 실제 서비스 품질은 운영 문의를 추가해 별도로 확인하세요.'), isAdmin() ? link('평가 및 자동화 설정 →', 'settings?tab=automation', 'button subtle small') : null); evaluation.append(evaluationBody); right.append(evaluation);
+  const evaluation = panel('검증 상태', '자동 답변을 켜기 전 확인'); const evaluationBody = el('div', 'panel-body'); const ev = data.evaluation; const passed = data.evaluation_passed; append(evaluationBody, badge(passed ? 'active' : 'review', passed ? (ev?.scope === 'moru' ? 'MORU 평가 통과' : '내장 평가 통과') : '평가 확인 필요'), el('p', 'mini-note', data.mode === 'shop' ? '현재 답변 규칙과 지식으로 운영자가 올린 평가 사례를 검증합니다.' : '내장 합성 문의로 동작을 검사합니다.'), isAdmin() ? link('평가 및 자동화 설정 →', 'settings?tab=automation', 'button subtle small') : null); evaluation.append(evaluationBody); right.append(evaluation);
   const welcome = el('section', 'panel welcome-card'); append(welcome, el('h2', '', '첫 답변을 만들어 볼까요?'), el('p', '', '모의 문의를 등록하고 수집한 뒤, 근거를 확인하며 답변 초안을 완성해 보세요.'), link('모의 Q&A 열기 →', 'demo', 'button small')); right.append(welcome); append(grid, recent, right); root.append(grid);
 }
 
-async function renderQuestions(root, params, selectedId) { const requestedFilter = params.get('status'); if (requestedFilter !== null) state.filter = requestedFilter; const data = await api(`/questions?status=${encodeURIComponent(state.filter)}&search=${encodeURIComponent(state.query)}`); state.questions = data; root.replaceChildren(heading('문의함', '질문의 맥락과 근거를 확인하고 답변을 완성하세요.', [button('게시판 수집', syncAndRefresh, '', 'refresh')], 'INQUIRIES'));
+async function renderQuestions(root, params, selectedId) { const requestedFilter = params.get('status'); if (requestedFilter !== null) state.filter = requestedFilter; else if (selectedId) { state.filter = ''; state.query = ''; } const data = await api(`/questions?status=${encodeURIComponent(state.filter)}&search=${encodeURIComponent(state.query)}`); state.questions = data; root.replaceChildren(heading('문의함', '질문의 맥락과 근거를 확인하고 답변을 완성하세요.', [button('게시판 수집', syncAndRefresh, '', 'refresh')], 'INQUIRIES'));
   await renderReferenceDrafts(root);
   const toolbar = el('div', 'toolbar inquiry-toolbar'); const tabs = el('div', 'tabs'); for (const [key, text] of [['', '전체'], ['review', '검토 대기'], ['draft', '초안'], ['confirm', '게시 확인'], ['posted', '완료'], ['external', '외부 답변']]) { const tab = el('button', `tab${state.filter === key ? ' active' : ''}`, text); tab.type = 'button'; tab.onclick = async () => { if (state.dirty && !await confirmAction('저장하지 않은 답변', '작성 중인 내용을 저장하지 않고 필터를 변경할까요?', '변경')) return; state.dirty = false; state.filter = key; location.hash = `questions?status=${key}`; if (location.hash.slice(1) === state.route) await renderRoute(true); }; tabs.append(tab); } const search = el('form', 'search-box'); const input = el('input'); input.type = 'search'; input.value = state.query; input.placeholder = '문의 제목 또는 내용 검색'; input.setAttribute('aria-label', '문의 검색'); append(search, icon('search', 16), input); search.onsubmit = async event => { event.preventDefault(); if (state.dirty && !await confirmAction('저장하지 않은 답변', '작성 중인 내용을 저장하지 않고 검색할까요?', '검색')) return; state.dirty = false; state.query = input.value.trim(); await renderRoute(true); }; append(toolbar, tabs, search); root.append(toolbar);
   if (!data.length) { root.append(append(el('div', 'panel'), empty(state.query ? '검색 결과가 없습니다' : '이 상태의 문의가 없습니다', '다른 필터를 선택하거나 모의 Q&A에서 새 문의를 등록하세요.'))); return; }
@@ -147,7 +147,52 @@ function dataTable(headers, rows) {
   for(const row of rows){const tr=el('tr');for(const value of row){const td=el('td');td.append(value instanceof Node?value:document.createTextNode(String(value??'')));tr.append(td);}body.append(tr);}
   wrap.append(table);return wrap;
 }
-async function renderNotifications(root){const rows=await api('/notifications');root.replaceChildren(heading('알림 기록','새 문의 알림과 이메일 전송 상태를 확인하세요.',[],'NOTIFICATIONS'));root.append(notice('앱 내 알림은 항상 저장됩니다','이메일 발송은 운영 설정에서 SMTP를 연결한 경우에만 진행됩니다. 고객 본문은 이메일에 포함하지 않습니다.'));root.append(rows.length?dataTable(['문의','이벤트','전송 상태','시도','등록 시각','오류'],rows.map(r=>[link(`#${r.question_id}`,`questions/${r.question_id}`),r.kind,badge(r.status),r.attempts,date(r.created_at),r.last_error||'—'])):empty('알림이 없습니다'));}
+async function renderNotifications(root){const rows=await api('/notifications');root.replaceChildren(heading('알림 기록','새 문의 알림과 이메일 전송 상태를 확인하세요.',[],'NOTIFICATIONS'));root.append(notice('앱 내 알림은 항상 저장됩니다','SMTP를 연결하면 검토가 남은 문의의 번호와 링크를 이메일로 보냅니다.'));root.append(rows.length?dataTable(['문의','이벤트','전송 상태','시도','등록 시각','오류'],rows.map(r=>[link(`#${r.question_id}`,`questions/${r.question_id}`),r.kind,badge(r.status, {confirm:'전송 확인 필요', sending:'메일 전송 중', retry:'재시도 대기'}[r.status]),r.attempts,date(r.created_at),r.last_error||'—'])):empty('알림이 없습니다'));}
+function moruEvaluationReport(report) {
+  const result = panel('최근 MORU 평가', report.passed ? '평가 파일의 통과 기준 충족' : '평가 파일의 통과 기준 미충족');
+  const body = el('div', 'panel-body');
+  const percent = value => `${Math.round(value * 1000) / 10}%`;
+  append(body, statusLine('평가 사례', `${report.total}건`), statusLine('정확히 게시할 사례', `${report.correct_auto}건`),
+    statusLine('잘못 게시할 사례', `${report.wrong_auto}건`), statusLine('정밀도 / 재현율', `${percent(report.precision)} / ${percent(report.recall)}`));
+  body.append(dataTable(['범주', '표현이 다른 정답', '보류 사례', '오답 게시'],
+    Object.entries(report.by_category).map(([key, counts]) => [category(key), counts.paraphrases, counts.negative, counts.wrong])));
+  const details = el('details');
+  append(details, el('summary', '', '사례별 판정'), dataTable(['사례', '범주', '기대', '판정', '이유'],
+    report.cases.map(row => [row.case, category(row.category), row.expected === 'auto' ? '게시' : '보류',
+      row.automatic ? (row.correct ? '게시' : '오답 게시') : '보류', row.reason])));
+  return append(result, append(body, details));
+}
+
+function moruEvaluationForm(settings) {
+  const section = panel('MORU 평가 CSV', '범주별로 표현을 바꾼 정답 사례와 보류 사례를 평가합니다.');
+  const form = el('form', 'panel-body');
+  const file = field('평가 CSV', 'cases', '', { type: 'file', required: true,
+    hint: 'UTF-8 · id, question, expected_action, expected_knowledge_id · 범주 지정은 category 열' });
+  $('input', file).accept = '.csv,text/csv';
+  const progress = el('p', 'mini-note');
+  progress.setAttribute('role', 'status');
+  append(form, notice('FAQ와 범주를 먼저 준비하세요', '지식 자료에서 자동 사용을 승인하고 아래에서 범주를 저장하세요. 각 범주는 표현이 다른 정답 사례를 맞히고 잘못 게시할 사례가 0건이어야 합니다.'),
+    append(el('div', 'actions'),
+      button('MORU FAQ 가져오기', async () => {
+        if (settings.api_configured && !await confirmAction('FAQ를 가져올까요?', '검색 색인에 OpenAI API 사용료가 발생할 수 있습니다.', '가져오기')) return;
+        const result = await api('/knowledge/moru-faqs', 'POST', {});
+        toast(`FAQ ${result.imported}건을 확인했습니다. 지식 자료에서 자동 사용을 승인하세요.`);
+      }), link('지식 자료 열기', 'knowledge', 'button subtle')),
+    file, progress, submit('MORU 평가 실행'));
+  $('button[type=submit]', form).disabled = !settings.api_configured;
+  if (!settings.api_configured) progress.textContent = '연결 · AI 탭에서 OpenAI API 키를 먼저 설정하세요.';
+  onSubmit(form, async values => {
+    if (!values.cases?.size || values.cases.size > 256000) throw new Error('256KB 이내의 평가 CSV를 선택하세요.');
+    if (!await confirmAction('MORU 평가를 시작할까요?', '현재 자동 모드를 끄고 OpenAI API로 사례를 평가합니다. 게시판에는 답글이 올라가지 않습니다.', '평가 시작')) return;
+    progress.textContent = '평가 중입니다. 사례 수에 따라 시간이 걸릴 수 있습니다.';
+    try {
+      await api('/evaluate/moru', 'POST', { csv: await values.cases.text() });
+    } finally {
+      if (form.isConnected) await renderRoute(true);
+    }
+  });
+  return append(section, form);
+}
 async function renderAudit(root){const rows=await api('/audit');root.replaceChildren(heading('감사 로그','설정·승인·게시 변경과 처리 결과를 확인하세요.',[],'ACTIVITY'));root.append(rows.length?dataTable(['시각','작업자','작업','대상','상세'],rows.map(r=>[date(r.created_at),r.actor,r.action,r.target,r.detail])):empty('아직 기록이 없습니다'));}
 async function renderSettings(root, params) {
   if(!isAdmin()){root.replaceChildren(empty('관리자 권한이 필요합니다'));return;}
@@ -166,20 +211,56 @@ async function renderSettings(root, params) {
     append(af,notice('모의 검색과 실제 AI를 구분합니다','키가 없으면 문자 기반 검색과 입력문 조합으로 시험합니다. 키를 설정하면 승인 지식의 임베딩과 답변 초안을 OpenAI API로 생성합니다.'),field('OpenAI API 키','api_key','',{type:'password',autocomplete:'off',placeholder:s.api_configured?'변경할 때만 입력':'선택 입력',hint:'이 PC에서 암호화해 저장하며 저장된 키는 화면에 표시하지 않습니다.'}),field('월 AI 추정 예산 (원)','budget_krw',s.budget_krw,{type:'number',min:1,max:1000000,required:true}),el('p','mini-note',`이번 달 추정 사용액 ${money(s.usage?.estimated_krw)} / ${money(s.usage?.budget_krw)} · 보수적 단가 기준이며 실제 청구액과 다를 수 있습니다.`),append(el('div','actions'),submit('AI 설정 저장'),button('키 삭제 · 모의 방식으로 전환',async()=>{await api('/settings','POST',{clear_api_key:true});toast('모의 검색으로 전환했습니다.');await renderRoute(true);},'danger')));
     onSubmit(af,async v=>{await api('/settings','POST',{api_key:v.api_key,budget_krw:Number(v.budget_krw)});toast('AI 설정을 저장했습니다.');await renderRoute(true);});ai.append(af);root.append(ai);
   }else if(state.settingsTab==='automation'){
-    if(s.mode==='shop')root.append(notice('쇼핑몰 자동 답변 검증 준비 중','고객사이트 문의 수집과 담당자 승인 답글 게시를 사용할 수 있습니다. 새 데이터의 의미·적용 조건 기반 자동 답변은 별도 평가 후 활성화합니다.','warning'));
+    const shop = s.mode === 'shop';
     const rules=s.reply_rules||{};const lines=value=>(Array.isArray(value)?value:[]).join('\n');const parseLines=value=>String(value||'').split(/\r?\n/).map(x=>x.trim()).filter(Boolean);
     const rulesPanel=panel('답변 규칙',`현재 규칙 버전 ${s.rules_version||0}`);const rulesForm=el('form','panel-body');
     append(rulesForm,notice('규칙이 없으면 자동 답변을 켤 수 없습니다','규칙을 바꾸면 기존 평가와 자동 모드가 해제되고, 저장된 초안은 다시 검토해야 합니다.'),field('말투','tone',rules.tone||'',{required:true,maxLength:500,placeholder:'예: 정중한 한국어 존댓말'}),field('예외 처리 기준','exception_policy',rules.exception_policy||'',{type:'textarea',required:true,maxLength:500,rows:3,placeholder:'예: 판단이 애매하면 자동 발송하지 않고 담당자에게 전달'}),field('금지 표현','forbidden_phrases',lines(rules.forbidden_phrases),{type:'textarea',rows:3,maxLength:5000,hint:'한 줄에 하나씩 입력합니다.'}),field('반드시 포함할 안내','required_phrases',lines(rules.required_phrases),{type:'textarea',rows:3,maxLength:5000,hint:'모든 답변에 꼭 들어가야 할 문구만 한 줄에 하나씩 입력합니다.'}),field('자동 답변 금지 주제','blocked_topics',lines(rules.blocked_topics),{type:'textarea',rows:3,maxLength:5000,placeholder:'환불\n결제\n개인정보',hint:'문의에 해당 문구가 있으면 담당자 검토로 보냅니다.'}),submit('답변 규칙 저장'));
     onSubmit(rulesForm,async v=>{await api('/settings','POST',{reply_rules:{tone:v.tone,exception_policy:v.exception_policy,forbidden_phrases:parseLines(v.forbidden_phrases),required_phrases:parseLines(v.required_phrases),blocked_topics:parseLines(v.blocked_topics)}});toast('답변 규칙을 저장했습니다. 자동 답변 평가는 다시 실행해야 합니다.');await renderRoute(true);});rulesPanel.append(rulesForm);root.append(rulesPanel);
-    const p=panel('조건부 자동 답변','모의 평가를 통과한 뒤 관리자가 직접 활성화합니다.');const body=el('div','panel-body');
-    append(body,notice('승인 FAQ와 정확히 일치하고 현재 규칙을 통과한 문의만 자동 게시합니다','개별 판단·근거 없음·상충·만료·과거 문의·금지 주제는 담당자가 처리합니다. 내장 합성 평가는 실제 서비스 품질 검증을 대신하지 않습니다.'),statusLine('답변 규칙',s.rules_version?`버전 ${s.rules_version}`:'미설정',''),statusLine('자동 모드',s.auto_enabled?'켜짐':'꺼짐'),statusLine('모의 평가',s.evaluation_passed?'통과':'미통과'),append(el('div','actions'),button('내장 100건 평가',async()=>{const result=await api('/evaluate','POST',{});await renderRoute(true);showResult('합성 문의 평가 결과',result);},'', 'shield'),button('게시 없이 판단 시험',async()=>showResult('자동 판단 시험',await api('/automation/run','POST',{dry_run:true})),'')));
-    const form=el('form');const autoCheck=check('조건을 충족한 새 문의에 자동 답변 게시','auto_enabled',s.auto_enabled);if(!s.rules_version)$('[name=auto_enabled]',autoCheck).disabled=true;form.append(autoCheck);for(const [key,label]of Object.entries({usage:'서비스 이용',hours:'이용 시간',policy:'운영 정책'}))form.append(check(label,key,(s.allowed_categories||[]).includes(key)));form.append(submit('자동화 설정 적용'));
-    onSubmit(form,async()=>{await api('/settings','POST',{auto_enabled:$('[name=auto_enabled]',form).checked,allowed_categories:['usage','hours','policy'].filter(k=>$(`[name=${k}]`,form).checked)});toast('자동화 설정을 적용했습니다.');await renderRoute(true);});body.append(form,button('지금 자동 처리',async()=>{const r=await api('/automation/run','POST',{dry_run:false});showResult('자동 처리 결과',r);},'primary'));p.append(body);root.append(p);
-    if(s.evaluation){const details={...s.evaluation};delete details.cases;root.append(resultBlock('최근 평가',details));}
+    if (shop) root.append(moruEvaluationForm(s));
+    const p = panel('조건부 자동 답변', '평가를 통과한 뒤 관리자가 활성화합니다.');
+    const body = el('div', 'panel-body');
+    append(body, shop
+      ? notice('의도와 적용 조건이 같은 새 문의에 승인 답변을 게시합니다', '개별 거래, 조건 차이, 근거 충돌, 문의 수정은 담당자에게 넘깁니다. 범주·규칙·지식·AI 설정이 바뀌면 다시 평가합니다.')
+      : notice('승인 FAQ와 정확히 일치한 문의에 게시합니다', '개별 판단·근거 없음·상충·만료·과거 문의·금지 주제는 담당자가 처리합니다.'),
+      statusLine('답변 규칙', s.rules_version ? `버전 ${s.rules_version}` : '미설정'),
+      statusLine('자동 모드', s.auto_enabled ? '켜짐' : '꺼짐'),
+      statusLine(shop ? 'MORU 평가' : '모의 평가', s.evaluation_passed ? '통과' : '평가 필요'),
+      append(el('div', 'actions'), shop ? null : button('내장 100건 평가', async () => {
+        const result = await api('/evaluate', 'POST', {});
+        await renderRoute(true);
+        showResult('합성 문의 평가 결과', result);
+      }, '', 'shield'), button('게시 없이 판단 시험', async () => {
+        if (shop && !await confirmAction('판단 시험을 실행할까요?', 'OpenAI API 사용료가 발생할 수 있습니다.', '시험 실행')) return;
+        showResult('자동 판단 시험', await api('/automation/run', 'POST', { dry_run: true }));
+      })));
+    const form = el('form');
+    const autoCheck = check('조건을 충족한 새 문의에 자동 답변 게시', 'auto_enabled', s.auto_enabled);
+    const enable = $('[name=auto_enabled]', autoCheck);
+    enable.disabled = !s.rules_version || (shop && !s.evaluation_passed);
+    const categories = s.automation_categories || ['usage', 'hours', 'policy'];
+    form.append(autoCheck);
+    for (const key of categories) {
+      const choice = check(category(key), key, (s.allowed_categories || []).includes(key));
+      if (shop) $('input', choice).onchange = () => { enable.checked = false; };
+      form.append(choice);
+    }
+    form.append(submit('자동화 설정 적용'));
+    onSubmit(form, async () => {
+      await api('/settings', 'POST', { auto_enabled: enable.checked,
+        allowed_categories: categories.filter(key => $(`[name=${key}]`, form).checked) });
+      toast('자동화 설정을 적용했습니다.');
+      await renderRoute(true);
+    });
+    append(body, form, button('지금 자동 처리', async () => {
+      showResult('자동 처리 결과', await api('/automation/run', 'POST', { dry_run: false }));
+    }, 'primary'));
+    root.append(append(p, body));
+    if (s.evaluation?.scope === 'moru') root.append(moruEvaluationReport(s.evaluation));
+    else if (s.evaluation) { const details = { ...s.evaluation }; delete details.cases; root.append(resultBlock('최근 평가', details)); }
   }else if(state.settingsTab==='email'){
-    const p=panel('SMTP 이메일 알림','TLS 연결을 사용하며 이메일에는 문의 번호만 포함합니다.');const form=el('form','panel-body');
+    const p=panel('SMTP 이메일 알림','TLS로 문의 번호와 로그인 후 열 수 있는 링크를 보냅니다.');const form=el('form','panel-body');
     for(const [name,label,type,value]of [['smtp_host','SMTP 서버','text',s.smtp_host],['smtp_port','포트 (STARTTLS 587 / SSL 465)','number',s.smtp_port||587],['smtp_user','SMTP 사용자','text',s.smtp_user],['smtp_password','SMTP 비밀번호 (변경 시 입력)','password',''],['smtp_from','발신 이메일','email',s.smtp_from],['smtp_to','수신 이메일','email',s.smtp_to]])form.append(field(label,name,value,{type,autocomplete:type==='password'?'off':undefined}));
-    append(form,append(el('div','actions'),submit('이메일 설정 저장'),button('시험 메일 보내기',async()=>{showResult('시험 메일',await api('/notifications/test','POST',{}));},'')));onSubmit(form,async v=>{await api('/settings','POST',{...v,smtp_port:Number(v.smtp_port),smtp_tls:true});toast('이메일 설정을 저장했습니다.');});p.append(form);root.append(p);
+    append(form,field('메일 링크의 문의데스크 주소','smtp_app_url',s.smtp_app_url,{type:'url',required:true,hint:'이 PC에서 열 때는 로컬 주소를 사용하세요.'}),append(el('div','actions'),submit('이메일 설정 저장'),button('시험 메일 보내기',async()=>{showResult('시험 메일',await api('/notifications/test','POST',{}));},'')));onSubmit(form,async v=>{await api('/settings','POST',{...v,smtp_port:Number(v.smtp_port),smtp_tls:true});toast('이메일 설정을 저장했습니다.');});p.append(form);root.append(p);
   }else if(state.settingsTab==='users'){
     const users=await api('/users');root.append(notice('활성 계정 최대 5명','관리자는 설정·지식 승인·백업을 관리하고 CS 담당자는 문의를 처리합니다.'));
     root.append(dataTable(['아이디','권한','상태','관리'],users.map(u=>[u.username,u.role==='admin'?'관리자':'CS',u.active?'활성':'비활성',u.id===state.me.user.id?'현재 계정':button(u.active?'비활성화':'활성화',async()=>{await api(`/users/${u.id}`,'PATCH',{active:!u.active});await renderRoute(true);},'small')])));

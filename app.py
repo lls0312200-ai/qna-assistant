@@ -28,7 +28,8 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from engine import Engine, WEBHOOK_EVENTS
+from engine import DEMO_AUTO_CATEGORIES, Engine, WEBHOOK_EVENTS
+from moru_evaluation import SHOP_AUTO_CATEGORIES
 from rag import AIClient, blocked_reason
 from security import hash_password, verify_password, load_master_key, encrypt_secret, decrypt_secret
 
@@ -65,6 +66,19 @@ def validate_account(data):
     return name, password
 
 
+def notification_url(value):
+    if not isinstance(value, str) or len(value) > 255 or any(c.isspace() or c == '\\' for c in value):
+        raise ValueError('문의데스크 주소를 확인해 주세요.')
+    parts = urlsplit(value)
+    if (not parts.hostname or parts.username is not None or parts.password is not None or parts.path not in ('', '/')
+            or parts.query or parts.fragment or '?' in value or '#' in value
+            or not (parts.scheme == 'https' or (parts.scheme == 'http' and parts.hostname in ('localhost', '127.0.0.1')))):
+        raise ValueError('문의데스크 기본 주소는 HTTPS 또는 이 PC의 로컬 HTTP 주소여야 합니다.')
+    if parts.port is not None and parts.port < 1:
+        raise ValueError('문의데스크 주소의 포트를 확인해 주세요.')
+    return value.rstrip('/')
+
+
 class Runtime:
     def __init__(self, folder):
         self.folder = Path(folder)
@@ -86,6 +100,7 @@ class Runtime:
                     amount REAL NOT NULL,status TEXT NOT NULL,input_tokens INTEGER NOT NULL DEFAULT 0,
                     output_tokens INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL);
             ''')
+            db.execute("UPDATE notifications SET status='confirm',last_error='서버 재시작 전 발송 결과 확인 필요' WHERE status='sending'")
         self.webhook_secret()
         self.configure_ai()
         self.configure_board()
@@ -251,7 +266,11 @@ class Runtime:
     def safe_settings(self):
         values = {k: v for k, v in self.engine.settings().items()
                   if not any(word in k.lower() for word in ('password', 'secret', 'encrypted', 'api_key', 'token'))}
+        if values['mode'] == 'shop':
+            values['evaluation_passed'] = self.engine.shop_evaluation_current()
+            values['auto_enabled'] = values['auto_enabled'] and values['evaluation_passed']
         values.update(api_configured=self.engine.ai is not None,
+                      automation_categories=SHOP_AUTO_CATEGORIES if values['mode'] == 'shop' else DEMO_AUTO_CATEGORIES,
                       smtp_configured=bool(values.get('smtp_host') and values.get('smtp_to')),
                       data_dir=str(self.folder),
                       external_unavailable_reason='독립된 MORU 모의 고객사이트와 HTTP API로 연결되어 있습니다.' if values.get('mode') == 'shop' else '내장 모의 게시판입니다. MORU 고객사이트는 별도 서버에서 실행합니다.',
@@ -316,6 +335,8 @@ class Runtime:
                         source.backup(target)
                 with contextlib.closing(self.engine.connect()) as db, db:
                     self.engine.migrate_webhooks(db)
+                    db.execute("UPDATE notifications SET status='confirm',next_attempt=NULL,last_error='복구 이전 발송 결과 확인 필요' "
+                               "WHERE status IN ('pending','retry','unconfigured','sending')")
                     db.execute('DELETE FROM sessions')
                     db.execute('DELETE FROM users')
                     for row in current_users:
@@ -372,20 +393,28 @@ class Runtime:
         settings = self.engine.settings()
         if not settings.get('smtp_host') or not settings.get('smtp_to'):
             return
-        with contextlib.closing(self.engine.connect()) as db, db:
-            rows = [dict(r) for r in db.execute("SELECT * FROM notifications WHERE status IN ('pending','retry','unconfigured') AND (next_attempt IS NULL OR next_attempt<=?) ORDER BY id LIMIT 10", (utcnow(),))]
-        for row in rows:
+        for _ in range(10):
+            with self.engine.lock, contextlib.closing(self.engine.connect()) as db, db:
+                db.execute("UPDATE notifications SET status='skipped',next_attempt=NULL,last_error='이미 답변한 문의' "
+                           "WHERE status IN ('pending','retry','unconfigured') AND question_id IN "
+                           "(SELECT id FROM questions WHERE status IN ('posted','external'))")
+                row = db.execute("SELECT * FROM notifications WHERE status IN ('pending','retry','unconfigured') "
+                                 "AND (next_attempt IS NULL OR next_attempt<=?) ORDER BY id LIMIT 1", (utcnow(),)).fetchone()
+                if row is None:
+                    break
+                attempts = row['attempts'] + 1
+                db.execute("UPDATE notifications SET status='sending',attempts=? WHERE id=?", (attempts, row['id']))
             client = None
             started_data = False
             try:
                 client = self.mail_connection(settings)
+                link = f"{settings['smtp_app_url']}/#questions/{row['question_id']}"
                 msg = self.email_message(settings, f"새 문의 #{row['question_id']}",
-                                         f"문의 #{row['question_id']}이 등록되었습니다. Q&A Assistant에서 확인하세요.\n고객 원문은 알림에 포함하지 않습니다.", row['id'])
+                                         f"문의 #{row['question_id']}을 확인해 주세요.\n{link}\n문의데스크 로그인 후 확인할 수 있습니다.", row['id'])
                 started_data = True
                 client.send_message(msg)
                 status, error, delay = 'sent', '', None
             except Exception:
-                attempts = int(row.get('attempts', 0)) + 1
                 status = 'confirm' if started_data else ('failed' if attempts >= 4 else 'retry')
                 error = '전송 결과 확인 필요' if started_data else '메일 연결·인증 실패. SMTP 설정을 확인하세요.'
                 delay = (datetime.now(timezone.utc) + timedelta(minutes=(1, 5, 15)[min(attempts-1, 2)])).isoformat()
@@ -394,7 +423,7 @@ class Runtime:
                     with contextlib.suppress(Exception):
                         client.quit()
             with contextlib.closing(self.engine.connect()) as db, db:
-                db.execute('UPDATE notifications SET status=?,last_error=?,next_attempt=?,attempts=attempts+1 WHERE id=?',
+                db.execute("UPDATE notifications SET status=?,last_error=?,next_attempt=? WHERE id=? AND status='sending'",
                            (status, error, delay, row['id']))
 
     def housekeeping(self):
@@ -424,8 +453,8 @@ class Runtime:
                 self.scheduler_error = ''
             except Exception:
                 self.scheduler_error = '수집·자동 처리에 실패했습니다. 연결 상태와 문의 목록을 확인하세요.'
-            self.process_notifications()
-            self.housekeeping()
+        self.process_notifications()
+        self.housekeeping()
 
 
 def create_app(data_dir=None, scheduler=True):
@@ -574,6 +603,13 @@ def create_app(data_dir=None, scheduler=True):
     def prepare_reference_drafts(user=Depends(admin)):
         return runtime.reference_drafts.start(user['username'])
 
+    @app.post('/api/knowledge/moru-faqs')
+    def import_moru_faqs(user=Depends(admin)):
+        with engine.lock:
+            if engine.settings()['mode'] != 'shop' or not engine.board:
+                raise ValueError('MORU 고객사이트를 먼저 연결해 주세요.')
+            return {'imported': runtime.reference_drafts.import_faqs(engine.board, user['username'])}
+
     @app.get('/api/questions/{ident}')
     def question(ident:int,user=Depends(authorized)):
         return engine.question(ident)
@@ -633,7 +669,7 @@ def create_app(data_dir=None, scheduler=True):
 
     @app.post('/api/settings')
     def save_settings(data:dict,user=Depends(admin)):
-        allowed={'mode','main_url','qna_url','poll_seconds','webhook_enabled','auto_enabled','allowed_categories','reply_rules','budget_krw','smtp_host','smtp_port','smtp_user','smtp_from','smtp_to','smtp_tls',
+        allowed={'mode','main_url','qna_url','poll_seconds','webhook_enabled','auto_enabled','allowed_categories','reply_rules','budget_krw','smtp_host','smtp_port','smtp_user','smtp_from','smtp_to','smtp_tls','smtp_app_url',
                  'model','embedding_model','use_environment_key','input_token_krw','output_token_krw','embedding_token_krw'}
         values={k:v for k,v in data.items() if k in allowed}
         for name in ('budget_krw','input_token_krw','output_token_krw','embedding_token_krw'):
@@ -650,8 +686,12 @@ def create_app(data_dir=None, scheduler=True):
             raise ValueError('이메일은 TLS 연결을 사용해야 합니다.')
         if 'smtp_port' in values and not 1<=int(values['smtp_port'])<=65535:
             raise ValueError('SMTP 포트를 확인하세요.')
+        if 'smtp_app_url' in values:
+            values['smtp_app_url'] = notification_url(values['smtp_app_url'])
         with engine.lock:
-            changed_model = any(k in values and values[k]!=engine.settings().get(k) for k in ('model','embedding_model','use_environment_key')) or bool(data.get('api_key')) or bool(data.get('clear_api_key'))
+            current = engine.settings()
+            changed_mode = values.get('mode', current['mode']) != current['mode']
+            changed_model = any(k in values and values[k] != current.get(k) for k in ('model','embedding_model','use_environment_key')) or bool(data.get('api_key')) or bool(data.get('clear_api_key'))
             if changed_model:
                 values.update(auto_enabled=False)
             engine.update_settings(values,user['username'])
@@ -668,8 +708,10 @@ def create_app(data_dir=None, scheduler=True):
             if changed_model:
                 sensitive['evaluation_passed']=False
             runtime.internal_settings(sensitive)
-            runtime.configure_ai()
-            runtime.configure_board()
+            if changed_model:
+                runtime.configure_ai()
+            if changed_mode:
+                runtime.configure_board()
         return runtime.safe_settings()
 
     @app.post('/api/connection/test')
@@ -707,6 +749,10 @@ def create_app(data_dir=None, scheduler=True):
     def evaluate(user=Depends(admin)):
         return engine.evaluate(user['username'])
 
+    @app.post('/api/evaluate/moru')
+    def evaluate_moru(data:dict,user=Depends(admin)):
+        return engine.evaluate_shop(data.get('csv'), user['username'])
+
     @app.post('/api/automation/run')
     def automate(data:dict,user=Depends(admin)):
         return engine.auto_process(user['username'],bool(data.get('dry_run',False)))
@@ -726,7 +772,11 @@ def create_app(data_dir=None, scheduler=True):
         try:
             client=runtime.mail_connection(settings)
             try:
-                client.send_message(runtime.email_message(settings,'Q&A Assistant 알림 시험','알림 연결 시험입니다. 고객 정보는 포함하지 않습니다.',secrets.token_hex(8)))
+                client.send_message(runtime.email_message(
+                    settings, 'Q&A Assistant 알림 시험',
+                    f"알림 연결 시험입니다.\n{settings['smtp_app_url']}/#questions",
+                    secrets.token_hex(8),
+                ))
             finally:
                 client.quit()
         except Exception:
