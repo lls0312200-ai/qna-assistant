@@ -19,7 +19,7 @@ from shop_connector import ShopBoard
 
 PLATFORMS = [
     {'id':'moru','name':'MORU 모의 쇼핑몰','supported':True,'description':'로컬 고객사이트에서 승인과 연결을 직접 시험할 수 있어요.'},
-    {'id':'cafe24','name':'카페24','supported':False,'description':'연동 준비 중 · 실제 OAuth 연결은 아직 제공하지 않아요.'},
+    {'id':'cafe24','name':'카페24','supported':True,'description':'공식 OAuth로 승인하고 게시판 목록을 확인해요.'},
     {'id':'imweb','name':'아임웹','supported':False,'description':'연동 준비 중 · 현재는 선택할 수 없어요.'},
     {'id':'custom','name':'자체 제작 사이트','supported':False,'description':'연동 준비 중 · 사이트별 연결 모듈이 필요해요.'},
 ]
@@ -94,7 +94,7 @@ class ConnectionWizard:
 
     def prepare(self, body, user, origin):
         if body.get('platform')!='moru':
-            raise ValueError('현재 실제로 연결할 수 있는 플랫폼은 MORU 모의 쇼핑몰입니다.')
+            raise ValueError('MORU 설정을 선택하거나 카페24 OAuth 화면에서 시작해 주세요.')
         url=site_url(body.get('site_url',''))
         # Keep both local sites on the same host so Strict session cookies survive the approval round trip.
         url=f"http://{urlsplit(origin).hostname}:8766"

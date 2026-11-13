@@ -57,7 +57,8 @@ def main():
             runtime.reference_drafts.start('local-admin')
         if not args.no_browser:
             threading.Timer(1.2,lambda:webbrowser.open(f'http://127.0.0.1:{args.port}')).start()
-        uvicorn.run(app,host='127.0.0.1',port=args.port,workers=1,access_log=False)
+        uvicorn.run(app,host='127.0.0.1',port=args.port,workers=1,access_log=False,
+                    proxy_headers=True,forwarded_allow_ips='127.0.0.1')
     finally:
         lock.close()
 

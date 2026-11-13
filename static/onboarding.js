@@ -2,15 +2,52 @@
 let connectionDraft=null;
 const connectionSteps=['플랫폼 선택','사이트 주소 입력','공식 연동 승인','게시판 선택','하네스 설정','연결 시험'];
 function connectionStep(setup){if(!setup)return 1;if(setup.status==='pending'||setup.status==='denied')return 3;if(!setup.board_id)return 4;if(!setup.rules)return 5;return 6;}
-async function renderConnectionWizard(root){
+
+async function renderCafe24(root, result) {
+  const info = await api('/cafe24');
+  const actions = link('사이트 연동으로 돌아가기', 'connect', 'button');
+  root.replaceChildren(heading('카페24 OAuth', '쇼핑몰 관리자가 게시판 읽기를 승인하면 목록을 확인할 수 있어요.', [actions], 'CONNECT YOUR SITE'));
+  if (result === 'connected' && info.connection) root.append(notice('카페24 승인을 확인했어요', '조회한 게시판 목록을 아래에서 확인하세요.', 'success'));
+  if (result === 'denied') root.append(notice('승인을 취소했어요', '아래에서 다시 승인할 수 있어요.', 'warning'));
+  if (result === 'failed') root.append(notice('연결을 확인하지 못했어요', '개발자센터의 콜백 주소, 앱 키, 게시판 읽기 권한을 확인하고 다시 승인하세요.', 'warning'));
+  if (!info.configured) {
+    root.append(notice('카페24 앱 설정이 필요해요',
+      info.redirect_uri ? `등록한 HTTPS 주소에서 접속하고 앱 설정을 확인하세요. 콜백 주소는 ${info.redirect_uri}입니다.` :
+      '카페24 개발자센터에 등록한 HTTPS 주소와 앱 정보가 준비되면 연결을 시작할 수 있어요.', 'warning'));
+  }
+  if (info.connection) {
+    const current = panel('카페24 게시판', `${info.connection.mall_id} · 쇼핑몰 번호 ${info.connection.shop_no}`,
+      info.configured ? button('목록 다시 확인', async () => {
+        await api('/cafe24/check', 'POST', {});
+        await renderCafe24(root);
+      }) : null);
+    const rows = info.connection.boards.map(board => [board.number, board.name]);
+    current.append(rows.length ? dataTable(['게시판 번호', '게시판 이름'], rows) : empty('조회할 수 있는 게시판이 없어요'));
+    root.append(current);
+  }
+  if (!info.configured) return;
+  const form = el('form', 'panel-body');
+  form.append(field('쇼핑몰 아이디', 'mall_id', info.connection?.mall_id || '', {
+    required: true, maxLength: 63, placeholder: '예: myshop', hint: '카페24 관리자에서 확인한 쇼핑몰 아이디를 입력하세요.',
+  }), submit(info.connection ? '카페24에서 다시 승인' : '카페24에서 승인'));
+  onSubmit(form, async values => {
+    const {approval_url} = await api('/cafe24/prepare', 'POST', {mall_id: values.mall_id.trim()});
+    location.assign(approval_url);
+  });
+  root.append(append(panel('쇼핑몰 승인'), form));
+}
+
+async function renderConnectionWizard(root, params){
   if(!isAdmin()){root.replaceChildren(empty('관리자만 사이트를 연결할 수 있습니다'));return;}
+  if (params.has('cafe24')) return renderCafe24(root, params.get('cafe24'));
   const info=await api('/onboarding');
   if(!connectionDraft||connectionDraft.setup?.id!==info.setup?.id||info.setup?.status==='complete'||connectionDraft.setup?.status==='pending'){
     connectionDraft={setup:info.setup,step:connectionStep(info.setup),platform:info.setup?.platform||'',url:info.setup?.site_url||info.current_url||'http://127.0.0.1:8766',rules:info.setup?.rules||info.rules};
   }
   const w=connectionDraft;
   function paint(){
-    root.replaceChildren(heading('사이트 연동','쇼핑몰을 연결하고, 문의를 처리할 기준을 설정하세요.',[],'CONNECT YOUR SITE'));
+    const cafe24Link = link('카페24 OAuth', 'connect?cafe24=setup', 'button');
+    root.replaceChildren(heading('사이트 연동','쇼핑몰을 연결하고, 문의를 처리할 기준을 설정하세요.',[cafe24Link],'CONNECT YOUR SITE'));
     if(info.connected&&w.setup?.status!=='complete')root.append(notice('기존 사이트가 연결되어 있습니다',`${info.current_url} · 새 연결의 마지막 시험을 통과하면 설정이 적용됩니다.`));
     const layout=el('div','connect-layout'),rail=el('aside','connect-rail'),steps=el('ol','connect-steps');
     connectionSteps.forEach((text,index)=>{const current=index+1===w.step,done=index+1<w.step;const item=el('li',current?'current':done?'done':'');append(item,el('span','step-number',done?'✓':index+1),append(el('div'),el('small','',`STEP ${String(index+1).padStart(2,'0')}`),el('strong','',text)));if(current)item.setAttribute('aria-current','step');steps.append(item);});
@@ -21,10 +58,13 @@ async function renderConnectionWizard(root){
     const back=()=>button('이전',()=>{state.dirty=false;w.step=Math.max(1,w.step-1);paint();},'');
     const applySetup=setup=>{w.setup=setup;w.step=connectionStep(setup);state.dirty=false;paint();};
     if(w.step===1){
-      title('어떤 플랫폼을 사용하시나요?','현재는 MORU 모의 쇼핑몰의 승인과 게시판 연결을 사용할 수 있어요.');
+      title('어떤 플랫폼을 사용하시나요?','연결할 쇼핑몰을 선택해 주세요.');
       const cards=el('div','platform-cards');
       for(const platform of info.platforms){const card=el('label',`platform-card${platform.supported?'':' unavailable'}`),radio=el('input');radio.type='radio';radio.name='platform';radio.value=platform.id;radio.disabled=!platform.supported;radio.checked=w.platform===platform.id;radio.onchange=()=>{w.platform=platform.id;paint();};append(card,radio,append(el('div'),append(el('div','platform-name'),el('strong','',platform.name),badge(platform.supported?'active':'inactive',platform.supported?'연결 가능':'준비 중')),el('p','',platform.description)));cards.append(card);}body.append(cards);
-      const next=button('사이트 주소 입력 →',()=>{w.step=2;paint();},'primary');next.disabled=!w.platform;actions(next);
+      const next=button(w.platform==='cafe24'?'카페24 설정':'사이트 주소 입력 →',()=>{
+        if (w.platform==='cafe24') { location.hash='connect?cafe24=setup'; return; }
+        w.step=2;paint();
+      },'primary');next.disabled=!w.platform;actions(next);
     }else if(w.step===2){
       title('사이트 주소를 알려주세요','MORU 고객사이트가 실행되는 주소를 입력해 주세요.');
       const form=el('form');form.append(field('사이트 주소','site_url',w.url,{type:'url',required:true,placeholder:'http://127.0.0.1:8766',hint:'현재 지원 주소: http://127.0.0.1:8766 또는 http://localhost:8766'}),notice('로그인 비밀번호를 입력하지 않습니다','다음 단계에서 MORU 화면을 열어 문의 조회·답글 작성 권한을 승인합니다.'));
@@ -32,7 +72,7 @@ async function renderConnectionWizard(root){
       form.append(append(el('div','connect-actions'),back(),submit('주소 확인하고 계속 →')));onSubmit(form,async values=>{w.url=values.site_url;applySetup(await api('/onboarding/prepare','POST',{platform:w.platform,site_url:w.url}));});body.append(form);
     }else if(w.step===3){
       title('사이트에서 연동을 승인해 주세요','MORU 화면에서 권한을 확인한 뒤 돌아오면 게시판을 선택할 수 있어요.');
-      body.append(append(el('div','connect-site-card'),el('strong','','MORU 모의 쇼핑몰'),el('span','',w.setup.site_url)),append(el('ul','permission-list'),...['문의 제목·내용·기존 답변 조회','고객사이트 원본 문의에 답글 작성','새 문의 알림 연결'].map(text=>el('li','',text))),notice('로컬 모의 승인 절차','실제 카페24·아임웹의 OAuth 승인은 아직 제공하지 않습니다. 이 단계는 MORU 고객사이트에서 동작합니다.'));
+      body.append(append(el('div','connect-site-card'),el('strong','','MORU 모의 쇼핑몰'),el('span','',w.setup.site_url)),append(el('ul','permission-list'),...['문의 제목·내용·기존 답변 조회','고객사이트 원본 문의에 답글 작성','새 문의 알림 연결'].map(text=>el('li','',text))),notice('로컬 모의 승인 절차','이 단계는 로컬 MORU 고객사이트에서 진행합니다.'));
       if(w.setup.status==='denied'){body.append(notice('연동 승인을 취소했습니다','기존 연결 설정은 유지됩니다. 다시 승인 요청을 보낼 수 있어요.','warning'));actions(back(),button('다시 승인 요청',async()=>applySetup(await api('/onboarding/prepare','POST',{platform:w.platform,site_url:w.url})),'primary'));}
       else{const approve=el('a','button primary','MORU에서 연동 승인 ↗');approve.href=w.setup.approval_url;actions(back(),approve);}
     }else if(w.step===4){

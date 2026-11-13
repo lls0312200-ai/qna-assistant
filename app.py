@@ -322,8 +322,11 @@ class Runtime:
                 current_users = [dict(r) for r in db.execute('SELECT * FROM users')]
                 current_usage = [dict(r) for r in db.execute('SELECT * FROM usage')]
                 current_webhooks = [dict(r) for r in db.execute('SELECT * FROM webhook_events')]
-                webhook_settings = {k: v for k, v in self.engine._settings(db).items()
-                                    if k in ('webhook_secret_encrypted', 'webhook_enabled', 'last_webhook', 'webhook_status')}
+                current_settings = self.engine._settings(db)
+                connection_secrets = {k: current_settings[k] for k in
+                                      ('webhook_secret_encrypted', 'webhook_enabled', 'last_webhook', 'webhook_status')
+                                      if k in current_settings}
+                connection_secrets['cafe24_token_encrypted'] = current_settings.get('cafe24_token_encrypted', '')
                 sequences = {r['name']: r['seq'] for r in db.execute('SELECT * FROM sqlite_sequence')}
             snapshot = self.folder / ('.restore-' + secrets.token_hex(8))
             try:
@@ -351,8 +354,8 @@ class Runtime:
                             db.execute('UPDATE sqlite_sequence SET seq=MAX(seq,?) WHERE name=?', (number, table))
                         else:
                             db.execute('INSERT INTO sqlite_sequence(name,seq) VALUES(?,?)', (table, number))
-                # Restoring content must not revive revoked webhook secrets or replay old deliveries.
-                self.internal_settings({**webhook_settings, 'auto_enabled': False, 'evaluation_passed': False})
+                # Restoring content must not roll back credentials or replay old deliveries.
+                self.internal_settings({**connection_secrets, 'auto_enabled': False, 'evaluation_passed': False})
                 # Apply privacy changes with offline indexing: a paid API outage must not undo deletion.
                 self.engine.ai = self.engine.rag.ai = None
                 self.engine.apply_tombstones(deleted)
@@ -458,6 +461,10 @@ class Runtime:
 
 
 def create_app(data_dir=None, scheduler=True):
+    from cafe24 import public_origin, register_cafe24_routes
+
+    origin = public_origin()
+    public_host = urlsplit(origin).hostname if origin else None
     runtime = Runtime(data_dir or default_data_dir())
     engine = runtime.engine
 
@@ -487,10 +494,15 @@ def create_app(data_dir=None, scheduler=True):
 
     app = FastAPI(title='Q&A Assistant', lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
     app.state.runtime = runtime
-    app.add_middleware(TrustedHostMiddleware, allowed_hosts=['127.0.0.1', 'localhost', 'testserver'])
+    allowed_hosts = ['127.0.0.1', 'localhost', 'testserver']
+    if public_host:
+        allowed_hosts.append(public_host)
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=allowed_hosts)
 
     @app.middleware('http')
     async def guard(request, call_next):
+        if public_host and request.url.hostname == public_host and request.url.scheme != 'https':
+            return JSONResponse({'detail': '공개 주소에서는 HTTPS로 접속하세요.'}, status_code=400)
         if request.method not in SAFE:
             origin = request.headers.get('origin')
             if origin and (urlsplit(origin).netloc != request.headers.get('host') or urlsplit(origin).scheme not in ('http','https')):
@@ -540,17 +552,20 @@ def create_app(data_dir=None, scheduler=True):
 
     from onboarding import register_connection_routes
     register_connection_routes(app, runtime, admin)
+    register_cafe24_routes(app, runtime, admin, origin)
 
     def me_data(request):
         user = session(request)
         return {'setup_required': runtime.setup_required(), 'user': {k:v for k,v in user.items() if k != 'csrf'} if user else None, 'csrf': user['csrf'] if user else None}
 
-    def create_session(user):
+    def create_session(user, request):
         token, csrf = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
         with contextlib.closing(engine.connect()) as db, db:
             db.execute('INSERT INTO sessions VALUES(?,?,?,?)', (hashlib.sha256(token.encode()).hexdigest(), user['id'], csrf, time.time()+8*3600))
         response = JSONResponse({'setup_required': False, 'user': {k: user[k] for k in ('id','username','role')}, 'csrf': csrf})
-        response.set_cookie(COOKIE, token, max_age=8*3600, httponly=True, samesite='strict', path='/')
+        public_session = public_host == request.url.hostname
+        response.set_cookie(COOKIE, token, max_age=8*3600, httponly=True, secure=public_session,
+                            samesite='lax' if public_session else 'strict', path='/')
         return response
 
     @app.get('/api/me')
@@ -574,7 +589,7 @@ def create_app(data_dir=None, scheduler=True):
             runtime.login_attempts[address] = attempts + [time.time()]
             raise HTTPException(401,'아이디 또는 비밀번호가 올바르지 않습니다.')
         runtime.login_attempts.pop(address,None)
-        return create_session(dict(row))
+        return create_session(dict(row), request)
 
     @app.post('/api/logout')
     def logout(request: Request,user=Depends(authorized)):
