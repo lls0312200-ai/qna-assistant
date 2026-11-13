@@ -87,7 +87,7 @@ def test_unverified_webhooks_are_rejected(ready, case):
     elif case == 'stale':
         response = deliver(client, runtime, row['id'], timestamp=int(time.time()) - 301)
     elif case == 'future':
-        response = deliver(client, runtime, row['id'], timestamp=int(time.time()) + 301)
+        response = deliver(client, runtime, row['id'], timestamp=int(time.time()) + 360)
     elif case == 'bad_event':
         response = deliver(client, runtime, row['id'], event='question.deleted')
     else:

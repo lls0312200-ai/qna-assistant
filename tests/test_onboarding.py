@@ -113,8 +113,8 @@ def test_unsupported_platform_and_missing_steps_are_rejected(bridge):
     client,runtime,_,_=bridge
     response=client.get('/api/onboarding')
     platforms=response.json()['platforms']
-    assert [p['id'] for p in platforms if p['supported']]==['moru']
-    assert client.post('/api/onboarding/prepare',json={'platform':'cafe24','site_url':'https://example.cafe24.com'}).status_code==400
+    assert [p['id'] for p in platforms if p['supported']]==['moru','cafe24']
+    assert client.post('/api/onboarding/prepare',json={'platform':'imweb','site_url':'https://example.com'}).status_code==400
     setup=prepare(bridge)
     assert client.post(f"/api/onboarding/{setup['id']}/test",json={}).status_code==400
     assert client.post(f"/api/onboarding/{setup['id']}/rules",json={'rules':TEST_RULES}).status_code==400

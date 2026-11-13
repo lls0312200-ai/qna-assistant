@@ -58,7 +58,7 @@ function showAuth() { $('#app').hidden = true; const root = $('#auth'); root.hid
   append(form, field('아이디', 'username', '', { required: true, autocomplete: 'username', placeholder: '아이디 입력', maxLength: 80 }), field('비밀번호', 'password', '', { type: 'password', required: true, minLength: 1, autocomplete: 'current-password', placeholder: '비밀번호 입력' }));
   form.append(submit('로그인', 'primary wide', 'arrow'));
   onSubmit(form, async values => { const result = await api('/login', 'POST', { username: values.username, password: values.password }); state.me = result?.user ? result : await api('/me'); state.dirty = false; showShell(); await renderRoute(true); toast('로그인했습니다.'); });
-  append(card, form, el('div', 'auth-footer', '실제 사이트에는 연결하지 않습니다. 외부 API 키 없이도 모의 검색과 답변 초안을 사용할 수 있습니다.'));
+  append(card, form, el('div', 'auth-footer', '외부 AI 키 없이도 모의 검색과 답변 초안을 사용할 수 있습니다.'));
   append(root, story, append(el('div', 'auth-form-wrap'), card));
 }
 
@@ -279,7 +279,7 @@ async function renderRoute(force=false) {
   const label=pages.find(p=>p[0]===page)?.[1]||'대시보드';$('#page-label').textContent=label;
   document.querySelectorAll('.nav-item').forEach(n=>n.classList.toggle('active',n.dataset.page===page));
   const root=el('div','page-view');$('#content').replaceChildren(root);root.append(el('p','mini-note','내용을 불러오는 중입니다…'));
-  try{const params=new URLSearchParams(query);if(page==='connect')await renderConnectionWizard(root);else if(page==='questions')await renderQuestions(root,params,id);else if(page==='knowledge')await renderKnowledge(root);else if(page==='demo')await renderDemo(root);else if(page==='settings')await renderSettings(root,params);else if(page==='notifications')await renderNotifications(root);else if(page==='audit')await renderAudit(root);else await renderDashboard(root);}catch(error){root.replaceChildren(notice('내용을 불러오지 못했습니다',error.message,'warning'),button('다시 시도',()=>renderRoute(true)));}
+  try{const params=new URLSearchParams(query);if(page==='connect')await renderConnectionWizard(root,params);else if(page==='questions')await renderQuestions(root,params,id);else if(page==='knowledge')await renderKnowledge(root);else if(page==='demo')await renderDemo(root);else if(page==='settings')await renderSettings(root,params);else if(page==='notifications')await renderNotifications(root);else if(page==='audit')await renderAudit(root);else await renderDashboard(root);}catch(error){root.replaceChildren(notice('내용을 불러오지 못했습니다',error.message,'warning'),button('다시 시도',()=>renderRoute(true)));}
 }
 $('#logout').addEventListener('click',async()=>{try{await api('/logout','POST',{});state.me=await api('/me');state.dirty=false;showAuth();}catch(error){toast(error.message,true);}});
 window.addEventListener('hashchange',()=>renderRoute());
