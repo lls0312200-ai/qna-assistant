@@ -3,17 +3,67 @@ let connectionDraft=null;
 const connectionSteps=['플랫폼 선택','사이트 주소 입력','공식 연동 승인','게시판 선택','하네스 설정','연결 시험'];
 function connectionStep(setup){if(!setup)return 1;if(setup.status==='pending'||setup.status==='denied')return 3;if(!setup.board_id)return 4;if(!setup.rules)return 5;return 6;}
 
+function connectionHero(title, description, status, action) {
+  const body = append(el('div', 'connect-hero-copy'),
+    append(el('span', 'connect-hero-icon'), icon('link', 22)),
+    el('h1', '', title), el('p', '', description));
+  const controls = append(el('div', 'connect-hero-controls'),
+    el('span', 'connect-state', status), action);
+  return append(el('header', 'connect-hero'), body, controls);
+}
+
 async function renderCafe24(root, result) {
   const info = await api('/cafe24');
-  const actions = link('사이트 연동으로 돌아가기', 'connect', 'button');
-  root.replaceChildren(heading('카페24 OAuth', '쇼핑몰 관리자가 게시판 읽기를 승인하면 목록을 확인할 수 있어요.', [actions], 'CONNECT YOUR SITE'));
-  if (result === 'connected' && info.connection) root.append(notice('카페24 승인을 확인했어요', '조회한 게시판 목록을 아래에서 확인하세요.', 'success'));
-  if (result === 'denied') root.append(notice('승인을 취소했어요', '아래에서 다시 승인할 수 있어요.', 'warning'));
-  if (result === 'failed') root.append(notice('연결을 확인하지 못했어요', '개발자센터의 콜백 주소, 앱 키, 게시판 읽기 권한을 확인하고 다시 승인하세요.', 'warning'));
+  root.classList.add('connect-page');
+  const status = !info.configured ? '설정 필요' : info.connection ? '승인 완료' : '승인 대기';
+  root.replaceChildren(connectionHero('카페24 연동', '쇼핑몰 관리자 승인 후 게시판 목록을 확인할 수 있어요.',
+    status, link('사이트 연동으로 돌아가기', 'connect', 'button')));
+  const main = el('div', 'cafe-main');
+  const layout = append(el('div', 'cafe-layout'), main);
+  root.append(layout);
+  if (result === 'connected' && info.connection) main.append(notice('카페24 승인을 확인했어요', '조회한 게시판 목록을 아래에서 확인하세요.', 'success'));
+  if (result === 'denied') main.append(notice('승인을 취소했어요', '아래에서 다시 승인할 수 있어요.', 'warning'));
+  if (result === 'failed') main.append(notice('연결을 확인하지 못했어요', '개발자센터의 콜백 주소, 앱 키, 게시판 읽기 권한을 확인하고 다시 승인하세요.', 'warning'));
   if (!info.configured) {
-    root.append(notice('카페24 앱 설정이 필요해요',
-      info.redirect_uri ? `등록한 HTTPS 주소에서 접속하고 앱 설정을 확인하세요. 콜백 주소는 ${info.redirect_uri}입니다.` :
-      '카페24 개발자센터에 등록한 HTTPS 주소와 앱 정보가 준비되면 연결을 시작할 수 있어요.', 'warning'));
+    const steps = el('ol', 'cafe-prerequisites');
+    const requirements = [
+      ['문의데스크 HTTPS 주소 준비', '카페24 승인 후 문의데스크로 돌아올 주소를 준비하세요.'],
+      ['카페24 개발자 앱 설정', '콜백 주소와 게시판 읽기 권한을 등록하고, 앱 키를 문의데스크 서버에 설정하세요.'],
+    ];
+    for (const [index, [name, detail]] of requirements.entries()) {
+      const number = el('span', 'cafe-step-number', index + 1);
+      number.setAttribute('aria-hidden', 'true');
+      steps.append(append(el('li'), number, el('strong', '', name), el('p', '', detail)));
+    }
+    const guide = el('a', 'button', '카페24 개발자 안내 ↗');
+    guide.href = 'https://developers.cafe24.com/app/front/app/develop/oauth/put';
+    guide.target = '_blank';
+    guide.rel = 'noopener noreferrer';
+    const setup = append(el('section', 'panel cafe-setup'),
+      el('h2', '', '연결 전 준비'),
+      el('p', 'cafe-intro', '아래 두 가지를 설정한 뒤 쇼핑몰 관리자 승인을 진행하세요.'),
+      steps);
+    if (info.redirect_uri) setup.append(append(el('div', 'cafe-callback'),
+      el('strong', '', '등록할 콜백 주소'), el('code', '', info.redirect_uri)));
+    setup.append(guide);
+    main.append(setup);
+  }
+  const permission = append(el('aside', 'cafe-permission'),
+    append(el('span', 'cafe-permission-icon'), icon('shield', 22)),
+    el('h2', '', '요청 권한'), el('strong', 'cafe-scope', '게시판 읽기'),
+    el('p', '', '승인한 쇼핑몰의 게시판 번호와 이름을 조회합니다.'),
+    el('p', 'cafe-scope-note', '문의 수집과 답글 게시는 현재 MORU에서 사용할 수 있어요.'));
+  layout.append(permission);
+  if (info.configured) {
+    const form = el('form', 'panel-body');
+    form.append(field('쇼핑몰 아이디', 'mall_id', info.connection?.mall_id || '', {
+      required: true, maxLength: 63, placeholder: '예: myshop', hint: '카페24 관리자에서 확인한 쇼핑몰 아이디를 입력하세요.',
+    }), submit(info.connection ? '카페24에서 다시 승인' : '카페24에서 승인'));
+    onSubmit(form, async values => {
+      const {approval_url} = await api('/cafe24/prepare', 'POST', {mall_id: values.mall_id.trim()});
+      location.assign(approval_url);
+    });
+    main.append(append(panel('쇼핑몰 승인'), form));
   }
   if (info.connection) {
     const current = panel('카페24 게시판', `${info.connection.mall_id} · 쇼핑몰 번호 ${info.connection.shop_no}`,
@@ -22,19 +72,10 @@ async function renderCafe24(root, result) {
         await renderCafe24(root);
       }) : null);
     const rows = info.connection.boards.map(board => [board.number, board.name]);
+    current.classList.add('cafe-boards');
     current.append(rows.length ? dataTable(['게시판 번호', '게시판 이름'], rows) : empty('조회할 수 있는 게시판이 없어요'));
-    root.append(current);
+    main.append(current);
   }
-  if (!info.configured) return;
-  const form = el('form', 'panel-body');
-  form.append(field('쇼핑몰 아이디', 'mall_id', info.connection?.mall_id || '', {
-    required: true, maxLength: 63, placeholder: '예: myshop', hint: '카페24 관리자에서 확인한 쇼핑몰 아이디를 입력하세요.',
-  }), submit(info.connection ? '카페24에서 다시 승인' : '카페24에서 승인'));
-  onSubmit(form, async values => {
-    const {approval_url} = await api('/cafe24/prepare', 'POST', {mall_id: values.mall_id.trim()});
-    location.assign(approval_url);
-  });
-  root.append(append(panel('쇼핑몰 승인'), form));
 }
 
 async function renderConnectionWizard(root, params){
@@ -45,15 +86,26 @@ async function renderConnectionWizard(root, params){
     connectionDraft={setup:info.setup,step:connectionStep(info.setup),platform:info.setup?.platform||'',url:info.setup?.site_url||info.current_url||'http://127.0.0.1:8766',rules:info.setup?.rules||info.rules};
   }
   const w=connectionDraft;
+  root.classList.add('connect-page');
   function paint(){
-    const cafe24Link = link('카페24 OAuth', 'connect?cafe24=setup', 'button');
-    root.replaceChildren(heading('사이트 연동','쇼핑몰을 연결하고, 문의를 처리할 기준을 설정하세요.',[cafe24Link],'CONNECT YOUR SITE'));
+    const cafe24Link = link('카페24 연동', 'connect?cafe24=setup', 'button');
+    root.replaceChildren(connectionHero('사이트 연동', '문의가 들어오는 쇼핑몰과 답변 기준을 관리하세요.',
+      info.connected ? 'MORU 연결됨' : '연결 전', cafe24Link));
     if(info.connected&&w.setup?.status!=='complete')root.append(notice('기존 사이트가 연결되어 있습니다',`${info.current_url} · 새 연결의 마지막 시험을 통과하면 설정이 적용됩니다.`));
     const layout=el('div','connect-layout'),rail=el('aside','connect-rail'),steps=el('ol','connect-steps');
-    connectionSteps.forEach((text,index)=>{const current=index+1===w.step,done=index+1<w.step;const item=el('li',current?'current':done?'done':'');append(item,el('span','step-number',done?'✓':index+1),append(el('div'),el('small','',`STEP ${String(index+1).padStart(2,'0')}`),el('strong','',text)));if(current)item.setAttribute('aria-current','step');steps.append(item);});
-    const progress=el('progress');progress.max=6;progress.value=w.step;progress.setAttribute('aria-label',`연결 설정 ${w.step}/6단계`);rail.append(steps,progress,el('p','mini-note','연결 승인 정보는 서버에 보관되며, 브라우저에 API 키를 표시하지 않습니다.'));
+    connectionSteps.forEach((text,index)=>{
+      const done=index+1<w.step||w.setup?.status==='complete';
+      const current=!done&&index+1===w.step;
+      const item=el('li',current?'current':done?'done':'');
+      const number=el('span','step-number',done?'✓':index+1);
+      number.setAttribute('aria-hidden','true');
+      append(item,number,el('strong','',text));
+      if(current)item.setAttribute('aria-current','step');
+      steps.append(item);
+    });
+    rail.append(el('h2', '', '연결 절차'), steps);
     const content=el('section','panel connect-content'),body=el('div','connect-body');content.append(body);layout.append(rail,content);root.append(layout);
-    const title=(name,description)=>append(body,el('div','eyebrow',`STEP ${String(w.step).padStart(2,'0')} OF 06`),el('h2','connect-title',name),el('p','connect-description',description));
+    const title=(name,description)=>append(body,el('h2','connect-title',name),el('p','connect-description',description));
     const actions=(...buttons)=>append(body,append(el('div','connect-actions'),...buttons));
     const back=()=>button('이전',()=>{state.dirty=false;w.step=Math.max(1,w.step-1);paint();},'');
     const applySetup=setup=>{w.setup=setup;w.step=connectionStep(setup);state.dirty=false;paint();};
@@ -89,7 +141,7 @@ async function renderConnectionWizard(root, params){
       title(complete?'사이트 연결을 마쳤어요':'마지막으로 연결을 시험할게요',complete?'문의 수집과 답글 게시에 사용할 연결·하네스 설정을 적용했습니다.':'문의 조회, 답글 작성, 서명된 문의 알림 수신을 차례로 확인합니다.');
       const chosen=(w.setup.boards||[]).find(b=>b.id===w.setup.board_id);const summary=el('div','connection-summary');summary.append(statusLine('플랫폼','MORU 모의 쇼핑몰'),statusLine('사이트 주소',w.setup.site_url),statusLine('게시판',chosen?.name||w.setup.board_id),statusLine('하네스','입력 완료'));body.append(summary);
       if(result){const checks=el('div','connection-checks');for(const item of result.checks||[])checks.append(append(el('div','connection-check'),icon('check',17),append(el('div'),el('strong','',item.name),el('small','',item.detail)),badge('active','통과')));body.append(checks,notice(result.passed?'연결 시험 통과':'연결 시험을 완료하지 못했습니다',result.message,result.passed?'success':'warning'));}
-      body.append(notice('자동 답변은 별도로 활성화합니다','연결 후에도 쇼핑몰의 의미·조건 기반 자동 답변은 별도 품질 검증이 필요합니다.'));
+      if(!complete)body.append(notice('자동 답변은 평가 후 켤 수 있어요','연결을 마친 뒤 운영 설정에서 답변 품질을 평가하세요.'));
       if(complete)actions(button('새 사이트 연동',()=>{w.rules=w.setup.rules;w.setup=null;w.platform='';w.step=1;info.connected=true;info.current_url=w.url;paint();}),link('문의함으로 이동 →','questions','button primary'));
       else{const run=button('연결 시험 및 설정 적용',async()=>{const pending=notice('연결을 확인하고 있습니다','창을 닫지 말고 잠시 기다려 주세요.');body.append(pending);try{applySetup(await api(`/onboarding/${w.setup.id}/test`,'POST',{}));}finally{pending.remove();}},'primary','link');actions(button('하네스 다시 확인',()=>{w.step=5;paint();}),run);}
     }

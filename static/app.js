@@ -63,14 +63,77 @@ function showAuth() { $('#app').hidden = true; const root = $('#auth'); root.hid
 }
 
 async function syncAndRefresh() { const data = await api('/sync', 'POST', {}); toast('모의 게시판 수집을 완료했습니다.'); await renderRoute(true); if (data?.error) toast(data.error, true); }
-async function renderDashboard(root) { const data = await api('/dashboard'); if (root !== $('#content').firstElementChild) return; const counts = data.counts || {}; root.replaceChildren(); append(root, heading('오늘의 문의 현황', '새로운 문의를 확인하고, 정확한 답변을 준비하세요.', [button('게시판 수집', syncAndRefresh, '', 'refresh'), link('문의함 열기 →', 'questions', 'button primary')], 'OVERVIEW'));
-  root.append(notice(data.mode==='shop'?'MORU 고객사이트와 연결되어 있습니다':'모의 사이트로 운영 중입니다', data.mode==='shop'?'별도 고객사이트에서 접수한 문의를 HTTP API로 수집하며, 승인한 답글은 해당 사이트의 원본 문의에 게시합니다.':'현재 화면의 문의와 답변은 내장 모의 게시판 데이터입니다.'));
-  if(data.customer_url){const source=el('a','button','MORU 고객사이트 열기 ↗');source.href=data.customer_url;source.target='_blank';source.rel='noopener';root.append(source);}
-  const stats = el('div', 'stats'); for (const [key, name, caption, image, tone] of [['review', '검토 대기', '담당자의 확인이 필요한 문의', 'inbox', 'orange'], ['draft', '답변 초안', '검토 후 게시할 수 있는 답변', 'file', ''], ['posted', '답변 완료', '게시가 확인된 문의', 'check', 'green'], ['confirm', '게시 확인 필요', '중복 게시 전 확인이 필요한 문의', 'clock', 'orange']]) { const card = link('', `questions?status=${key}`, `stat ${tone}`); append(card, append(el('div', 'stat-label'), el('span', '', name), append(el('span', 'stat-icon'), icon(image, 18))), append(el('div', 'stat-value', counts[key] || 0), el('small', '', '건')), el('div', 'stat-caption', caption)); stats.append(card); } root.append(stats);
-  const grid = el('div', 'dashboard-grid'); const recent = panel('최근 접수 문의', '처리 현황과 확인이 필요한 문의를 살펴보세요.', link('전체 보기 →', 'questions')); const questions = data.recent || data.questions || []; if (!questions.length) recent.append(empty('접수된 문의가 없습니다', '모의 Q&A에서 문의를 추가하고 게시판을 수집하세요.')); else questions.slice(0, 7).forEach((q, index) => { const row = link('', `questions/${q.id}`, 'question-row'); append(row, el('span', 'question-index', String(index + 1).padStart(2, '0')), append(el('div', 'question-row-main'), append(el('div'), badge(q.status), el('span', 'category-label', category(q.category))), el('h3', '', q.title), append(el('p'), el('span', '', `#${q.external_id || q.id}`), el('span', '', date(q.created_at, true)))), append(el('span', 'button subtle small'), document.createTextNode('확인'), icon('arrow', 13))); recent.append(row); });
-  const right = el('div', 'stack'); const operation = panel('운영 상태', '모의 사이트 기준'); const operationBody = el('div', 'panel-body'); append(operationBody, statusLine('게시판 연결', connectionNames[data.connection_status] || data.connection_status || '미확인', ['connected', 'ok', 'demo'].includes(data.connection_status) ? 'good' : ''), statusLine('답변 규칙', data.rules_version ? `버전 ${data.rules_version}` : '설정 필요', data.rules_version ? 'good' : 'warn'), statusLine('자동 답변', data.auto_enabled ? '활성화' : '검토 후 수동 게시', data.auto_enabled ? 'good' : ''), statusLine('웹훅 수신', data.webhook_enabled === false ? '꺼짐 · 주기 확인만 사용' : data.last_webhook ? `${date(data.last_webhook, true)} · ${data.webhook_status || '정상'}` : '대기 중', data.webhook_enabled === false ? '' : (data.webhook_status || '').includes('실패') ? 'warn' : 'good'), statusLine('주기 확인', `${Math.round((data.poll_seconds || 1800) / 60)}분마다 · 최근 ${date(data.last_sync, true)}`), data.next_poll ? statusLine('다음 확인', date(data.next_poll, true)) : null, statusLine('승인된 지식', `${data.knowledge_active || 0}개`), el('hr', 'divider'), el('p', 'mini-note', '기존 문의는 자동 답변에서 제외하며, 근거와 현재 규칙을 통과한 신규 문의만 자동 처리합니다.')); operation.append(operationBody); right.append(operation);
-  const evaluation = panel('검증 상태', '자동 답변을 켜기 전 확인'); const evaluationBody = el('div', 'panel-body'); const ev = data.evaluation; const passed = data.evaluation_passed; append(evaluationBody, badge(passed ? 'active' : 'review', passed ? (ev?.scope === 'moru' ? 'MORU 평가 통과' : '내장 평가 통과') : '평가 확인 필요'), el('p', 'mini-note', data.mode === 'shop' ? '현재 답변 규칙과 지식으로 운영자가 올린 평가 사례를 검증합니다.' : '내장 합성 문의로 동작을 검사합니다.'), isAdmin() ? link('평가 및 자동화 설정 →', 'settings?tab=automation', 'button subtle small') : null); evaluation.append(evaluationBody); right.append(evaluation);
-  const welcome = el('section', 'panel welcome-card'); append(welcome, el('h2', '', '첫 답변을 만들어 볼까요?'), el('p', '', '모의 문의를 등록하고 수집한 뒤, 근거를 확인하며 답변 초안을 완성해 보세요.'), link('모의 Q&A 열기 →', 'demo', 'button small')); right.append(welcome); append(grid, recent, right); root.append(grid);
+async function renderDashboard(root) {
+  const data = await api('/dashboard');
+  if (root !== $('#content').firstElementChild) return;
+  const counts = data.counts || {};
+  const board = data.mode === 'shop' ? 'MORU 고객사이트' : '내장 모의 게시판';
+  root.classList.add('dashboard-page');
+
+  const openInbox = link('문의함 열기', 'questions?status=', 'button primary');
+  openInbox.append(icon('arrow', 16));
+  const hero = append(el('header', 'dashboard-hero'),
+    append(el('div', 'dashboard-hero-copy'),
+      append(el('span', 'dashboard-source'), icon('link', 15), el('span', '', board)),
+      el('h1', '', '문의 현황'),
+      el('p', '', `마지막 수집  ${date(data.last_sync, true)}`)),
+    append(el('div', 'dashboard-actions'), button('게시판 수집', syncAndRefresh, '', 'refresh'), openInbox));
+  root.replaceChildren(hero);
+
+  const stats = el('div', 'stats');
+  for (const [key, name, image, tone] of [
+    ['review', '검토 대기', 'inbox', 'violet'],
+    ['draft', '답변 초안', 'file', ''],
+    ['posted', '답변 완료', 'check', 'green'],
+    ['confirm', '게시 확인 필요', 'clock', 'orange'],
+  ]) {
+    const card = link('', `questions?status=${key}`, `stat ${tone}`);
+    append(card,
+      append(el('div', 'stat-label'), el('span', '', name), append(el('span', 'stat-icon'), icon(image, 17))),
+      append(el('div', 'stat-value', Number(counts[key] || 0).toLocaleString('ko-KR')), el('small', '', '건')));
+    stats.append(card);
+  }
+  root.append(stats);
+
+  const recent = panel('최근 접수 문의', '', link('전체 보기 →', 'questions?status='));
+  const questions = data.recent || data.questions || [];
+  if (!questions.length) {
+    recent.append(empty('접수된 문의가 없습니다', '게시판을 수집하면 이곳에서 확인할 수 있어요.'));
+  }
+  for (const q of questions.slice(0, 7)) {
+    const row = link('', `questions/${q.id}`, 'question-row');
+    append(row,
+      append(el('div', 'question-row-main'), el('h3', '', q.title),
+        append(el('p'), el('span', '', category(q.category)), el('span', '', date(q.created_at, true)))),
+      badge(q.status), append(el('span', 'dashboard-row-arrow'), icon('arrow', 15)));
+    recent.append(row);
+  }
+
+  const operation = panel('운영 상태', '');
+  const operationBody = append(el('div', 'panel-body'),
+    statusLine('게시판', connectionNames[data.connection_status] || data.connection_status || '미확인'),
+    statusLine('자동 답변', data.auto_enabled ? '켜짐' : '검토 후 수동 게시', data.auto_enabled ? 'good' : ''),
+    statusLine('답변 규칙', data.rules_version ? `버전 ${data.rules_version}` : '설정 필요', data.rules_version ? '' : 'warn'),
+    statusLine('웹훅', data.webhook_enabled === false ? '꺼짐' : data.last_webhook ? data.webhook_status || '수신됨' : '수신 대기',
+      (data.webhook_status || '').includes('실패') ? 'warn' : ''),
+    statusLine('주기 확인', `${Math.round((data.poll_seconds || 1800) / 60)}분마다`),
+    data.next_poll ? statusLine('다음 수집', date(data.next_poll, true)) : null,
+    statusLine('승인된 지식', `${data.knowledge_active || 0}개`));
+  if (data.mode === 'shop' && data.customer_url) {
+    const source = el('a', 'dashboard-panel-link', 'MORU 고객사이트 ↗');
+    source.href = data.customer_url;
+    source.target = '_blank';
+    source.rel = 'noopener';
+    operationBody.append(source);
+  }
+  operation.append(operationBody);
+
+  const evaluation = panel('자동 답변 평가', '');
+  const passed = data.evaluation_passed;
+  append(evaluation, append(el('div', 'panel-body'),
+    badge(passed ? 'active' : 'review', passed ? '평가 통과' : '평가 확인 필요'),
+    isAdmin() ? link('평가 및 자동화 설정 →', 'settings?tab=automation', 'dashboard-panel-link') : null));
+  root.append(append(el('div', 'dashboard-grid'), recent, append(el('div', 'stack'), operation, evaluation)));
 }
 
 async function renderQuestions(root, params, selectedId) { const requestedFilter = params.get('status'); if (requestedFilter !== null) state.filter = requestedFilter; else if (selectedId) { state.filter = ''; state.query = ''; } const data = await api(`/questions?status=${encodeURIComponent(state.filter)}&search=${encodeURIComponent(state.query)}`); state.questions = data; root.replaceChildren(heading('문의함', '질문의 맥락과 근거를 확인하고 답변을 완성하세요.', [button('게시판 수집', syncAndRefresh, '', 'refresh')], 'INQUIRIES'));
